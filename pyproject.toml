@@ -1,0 +1,76 @@
+[build-system]
+requires = ["uv_build>=0.11.28,<0.12"]
+build-backend = "uv_build"
+
+[project]
+name = "ternarycnn"
+version = "0.1.0"
+description = "Reusable PyTorch layers and model building blocks for ternary neural networks."
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "pydantic>=2.7",
+    "torch>=2.2",
+    "torchvision>=0.17",
+]
+keywords = ["deep-learning", "pytorch", "quantization", "ternary-neural-networks"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.optional-dependencies]
+augment = [
+    "albumentations>=2.0",
+    "numpy>=1.26",
+    "opencv-python-headless>=4.9",
+]
+dinov3 = [
+    "numpy>=1.26",
+    "omegaconf>=2.3",
+    "pillow>=10",
+    "pyyaml>=6",
+    "submitit>=1.5",
+    "termcolor>=2.4",
+    "torchmetrics>=1.4",
+]
+dinov3-eval = [
+    "ftfy>=6.2",
+    "matplotlib>=3.8",
+    "openpyxl>=3.1",
+    "pandas>=2.2",
+    "regex>=2024.5.15",
+    "scikit-learn>=1.4",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2",
+    "pytest-cov>=5",
+    "ruff>=0.12",
+]
+
+[tool.uv.build-backend]
+module-name = "ternarylayers"
+module-root = ""
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+extend-exclude = ["ternarylayers/dinov3"]
+
+[tool.ruff.lint]
+# Keep the initial quality gate focused on correctness while the inherited
+# modules are incrementally reformatted and cleaned up.
+select = ["E9", "F63", "F7", "F82"]
