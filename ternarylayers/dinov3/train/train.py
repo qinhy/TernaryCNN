@@ -17,7 +17,7 @@ import torch
 import torch.distributed
 from torch.distributed._tensor import DTensor
 
-import dinov3.distributed as distributed
+import ternarylayers.dinov3.distributed as distributed
 from ternarylayers.dinov3.checkpointer import (
     find_latest_checkpoint,
     keep_checkpoint_copy,

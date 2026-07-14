@@ -8,7 +8,7 @@ import re
 import torch
 
 from ternarylayers.dinov3.layers.attention import LinearKMaskedBias
-from ternarylayers.dinov3.layers.ternarylayers import Linear as BitLinear
+from ternarylayers.dinov3.layers.bitlayers import Linear as BitLinear
 from ternarylayers.dinov3.utils import named_replace
 
 # avoid division by zero when calculating scale

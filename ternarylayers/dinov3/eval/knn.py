@@ -17,7 +17,7 @@ import torch.backends.cudnn as cudnn
 from omegaconf import MISSING
 from torch.nn.functional import one_hot, softmax
 
-import dinov3.distributed as distributed
+import ternarylayers.dinov3.distributed as distributed
 from ternarylayers.dinov3.data import SamplerType, make_data_loader, make_dataset
 from ternarylayers.dinov3.data.adapters import DatasetWithEnumeratedTargets
 from ternarylayers.dinov3.data.transforms import (

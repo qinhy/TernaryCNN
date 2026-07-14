@@ -12,7 +12,7 @@ import numpy as np
 import torch
 
 from ternarylayers.dinov3.data import make_dataset, make_data_loader, DatasetWithEnumeratedTargets, SamplerType
-import dinov3.distributed as distributed
+import ternarylayers.dinov3.distributed as distributed
 
 
 logger = logging.getLogger("dinov3")

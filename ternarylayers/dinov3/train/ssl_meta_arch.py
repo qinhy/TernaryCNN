@@ -11,7 +11,7 @@ import torch
 from omegaconf import OmegaConf
 from torch import Tensor, nn
 
-import dinov3.distributed as distributed
+import ternarylayers.dinov3.distributed as distributed
 from ternarylayers.dinov3.checkpointer import init_fsdp_model_from_checkpoint
 from ternarylayers.dinov3.configs import get_default_config
 from ternarylayers.dinov3.data import DataAugmentationDINO

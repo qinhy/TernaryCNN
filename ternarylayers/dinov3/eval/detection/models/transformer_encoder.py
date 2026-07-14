@@ -15,7 +15,7 @@ Copy-paste from torch.nn.Transformer with modifications:
 """
 from typing import Optional
 
-from ternarylayers.dinov3.layers.ternarylayers import Linear as BitLinear
+from ternarylayers.dinov3.layers.bitlayers import Linear as BitLinear
 from torch import Tensor, nn
 
 from ..util.misc import _get_activation_fn, _get_clones

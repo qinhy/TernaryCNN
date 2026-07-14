@@ -12,7 +12,7 @@ from torch import nn, Tensor
 from torch.nn import functional as F
 
 from ternarylayers.dinov3.eval.segmentation.models.utils.position_encoding import PositionEmbeddingSine
-from ternarylayers.dinov3.layers.ternarylayers import Conv2d as BitConv2d, Linear as BitLinear
+from ternarylayers.dinov3.layers.bitlayers import Conv2d as BitConv2d, Linear as BitLinear
 
 
 def c2_xavier_fill(module: nn.Module) -> None:

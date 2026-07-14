@@ -12,7 +12,7 @@ import torch.nn.functional as F
 import xformers.ops as xops
 
 from ternarylayers.dinov3.utils import named_apply, named_replace
-from ternarylayers.dinov3.layers.ternarylayers import Linear as BitLinear
+from ternarylayers.dinov3.layers.bitlayers import Linear as BitLinear
 
 logger = logging.getLogger("dinov3")
 

@@ -70,6 +70,9 @@ def convert_to_ternary(module: nn.Module) -> nn.Module:
         from copy import deepcopy
         ternary_model = convert_to_ternary(deepcopy(model))
     """
+    if hasattr(module, "to_ternary"):
+        return module.to_ternary()
+
     for name, child in list(module.named_children()):
         if hasattr(child, "to_ternary"):
             setattr(module, name, child.to_ternary())

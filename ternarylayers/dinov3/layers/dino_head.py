@@ -5,7 +5,7 @@
 
 import torch
 import torch.nn as nn
-from ternarylayers.dinov3.layers.ternarylayers import Linear as BitLinear
+from ternarylayers.dinov3.layers.bitlayers import Linear as BitLinear
 from torch.nn.init import trunc_normal_
 
 

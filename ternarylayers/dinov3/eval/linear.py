@@ -17,11 +17,11 @@ from typing import Any, Callable, Dict, Optional, Tuple
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
-from ternarylayers.dinov3.layers.ternarylayers import Linear as BitLinear
+from ternarylayers.dinov3.layers.bitlayers import Linear as BitLinear
 from omegaconf import MISSING
 from torch.nn.parallel import DistributedDataParallel
 
-import dinov3.distributed as distributed
+import ternarylayers.dinov3.distributed as distributed
 from ternarylayers.dinov3.checkpointer import (
     CheckpointRetentionPolicy,
     cleanup_checkpoint,

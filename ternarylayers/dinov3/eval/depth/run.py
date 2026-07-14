@@ -12,7 +12,7 @@ from typing import Any, Dict
 import torch
 from omegaconf import OmegaConf
 
-import dinov3.distributed as distributed
+import ternarylayers.dinov3.distributed as distributed
 from ternarylayers.dinov3.eval.depth.checkpoint_utils import find_latest_checkpoint
 from ternarylayers.dinov3.eval.depth.config import DepthConfig
 from ternarylayers.dinov3.eval.depth.eval import evaluate_depther_with_config

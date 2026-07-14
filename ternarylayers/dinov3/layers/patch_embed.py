@@ -6,7 +6,7 @@
 import math
 from typing import Callable, Tuple, Union
 
-from ternarylayers.dinov3.layers.ternarylayers import Conv2d as BitConv2d, Linear
+from ternarylayers.dinov3.layers.bitlayers import Conv2d as BitConv2d, Linear
 from torch import Tensor, nn
 
 

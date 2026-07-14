@@ -8,7 +8,7 @@ import logging
 
 import torch
 
-import dinov3.distributed as distributed
+import ternarylayers.dinov3.distributed as distributed
 from ternarylayers.dinov3.data import DatasetWithEnumeratedTargets, SamplerType, make_data_loader, make_dataset
 from ternarylayers.dinov3.eval.segmentation.inference import make_inference
 from ternarylayers.dinov3.eval.segmentation.metrics import (

@@ -14,7 +14,7 @@ from typing import Any, List, Optional, Sequence, Tuple
 
 from omegaconf import DictConfig, OmegaConf
 
-import dinov3.distributed as distributed
+import ternarylayers.dinov3.distributed as distributed
 from ternarylayers.dinov3.logging import cleanup_logging, setup_logging
 from ternarylayers.dinov3.utils import fix_random_seeds, get_conda_env, get_sha
 

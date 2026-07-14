@@ -10,7 +10,7 @@ from typing import Any
 import torch
 from omegaconf import OmegaConf
 
-import dinov3.distributed
+import ternarylayers.dinov3.distributed
 from ternarylayers.dinov3.eval import results
 
 logger = logging.getLogger("dinov3")
@@ -21,7 +21,7 @@ EVAL_CONFIG_FNAME = "eval_config.yaml"
 
 def write_results(results_dict, output_dir, results_filename) -> None:
     """Save only on main if cuda is available"""
-    if torch.cuda.is_available() and not dinov3.distributed.is_main_process():
+    if torch.cuda.is_available() and not distributed.is_main_process():
         return
     results_path = os.path.join(output_dir, results_filename)
     logger.info(f"Saving results to {results_path}")
@@ -45,7 +45,7 @@ def args_dict_to_dataclass(eval_args: dict[str, object], config_dataclass, save_
     logger.info(f"Evaluation Configuration:\n{OmegaConf.to_yaml(structured_config)}")
     output_dir = structured_config.output_dir
 
-    if save_config and dinov3.distributed.is_main_process():
+    if save_config and distributed.is_main_process():
         OmegaConf.save(config=structured_config, f=os.path.join(output_dir, EVAL_CONFIG_FNAME))
 
     return OmegaConf.to_object(structured_config), output_dir

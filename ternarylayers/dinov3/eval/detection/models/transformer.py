@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ternarylayers.dinov3.layers.ternarylayers import Conv2d as BitConv2d, Linear as BitLinear
+from ternarylayers.dinov3.layers.bitlayers import Conv2d as BitConv2d, Linear as BitLinear
 from torch.nn.init import constant_, normal_, xavier_uniform_
 
 from ..util.box_ops import box_xyxy_to_cxcywh, delta2bbox

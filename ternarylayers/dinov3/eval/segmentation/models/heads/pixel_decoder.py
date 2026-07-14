@@ -17,7 +17,7 @@ from ternarylayers.dinov3.eval.segmentation.models.utils.batch_norm import get_n
 from ternarylayers.dinov3.eval.segmentation.models.utils.position_encoding import PositionEmbeddingSine
 from ternarylayers.dinov3.eval.segmentation.models.utils.transformer import _get_clones, _get_activation_fn
 from ternarylayers.dinov3.eval.segmentation.models.utils.ms_deform_attn import MSDeformAttn
-from ternarylayers.dinov3.layers.ternarylayers import Conv2d as BitConv2d, Linear as BitLinear
+from ternarylayers.dinov3.layers.bitlayers import Conv2d as BitConv2d, Linear as BitLinear
 
 
 def c2_xavier_fill(module: nn.Module) -> None:

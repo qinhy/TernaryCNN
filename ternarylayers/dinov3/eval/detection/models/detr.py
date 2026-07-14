@@ -25,7 +25,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ternarylayers.dinov3.layers.ternarylayers import Conv2d as BitConv2d, Linear as BitLinear
+from ternarylayers.dinov3.layers.bitlayers import Conv2d as BitConv2d, Linear as BitLinear
 
 from ..util import box_ops
 from ..util.misc import NestedTensor, _get_clones, inverse_sigmoid, nested_tensor_from_tensor_list

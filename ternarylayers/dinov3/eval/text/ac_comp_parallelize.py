@@ -9,7 +9,7 @@ from functools import partial
 
 import torch
 import torch.nn as nn
-from ternarylayers.dinov3.layers.ternarylayers import Linear as BitLinear
+from ternarylayers.dinov3.layers.bitlayers import Linear as BitLinear
 from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import register_fsdp_forward_method

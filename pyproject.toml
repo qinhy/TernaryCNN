@@ -26,6 +26,11 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
+[project.urls]
+Homepage = "https://github.com/qinhy/TernaryCNN"
+Issues = "https://github.com/qinhy/TernaryCNN/issues"
+Repository = "https://github.com/qinhy/TernaryCNN"
+
 [project.optional-dependencies]
 augment = [
     "albumentations>=2.0",

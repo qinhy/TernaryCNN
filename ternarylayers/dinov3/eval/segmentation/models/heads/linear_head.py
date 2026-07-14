@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ternarylayers.dinov3.layers.ternarylayers import Conv2d as BitConv2d
+from ternarylayers.dinov3.layers.bitlayers import Conv2d as BitConv2d
 
 
 class LinearHead(nn.Module):

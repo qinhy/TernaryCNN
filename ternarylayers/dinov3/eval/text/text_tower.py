@@ -10,7 +10,7 @@ import torch
 
 from ternarylayers.dinov3.eval.text.text_transformer import TextTransformer
 from ternarylayers.dinov3.layers import CausalSelfAttentionBlock
-from ternarylayers.dinov3.layers.ternarylayers import Linear as BitLinear
+from ternarylayers.dinov3.layers.bitlayers import Linear as BitLinear
 from torch import nn
 
 logger = logging.getLogger("dinov3")

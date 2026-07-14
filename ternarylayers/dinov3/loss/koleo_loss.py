@@ -8,7 +8,7 @@ import torch.distributed as torch_dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-import dinov3.distributed as dist
+import ternarylayers.dinov3.distributed as dist
 
 
 class KoLeoLoss(nn.Module):

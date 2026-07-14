@@ -4,7 +4,7 @@
 # the terms of the DINOv3 License Agreement.
 
 import torch
-from ternarylayers.dinov3.layers.ternarylayers import Conv2d as BitConv2d, Linear as BitLinear
+from ternarylayers.dinov3.layers.bitlayers import Conv2d as BitConv2d, Linear as BitLinear
 from torch import nn
 
 

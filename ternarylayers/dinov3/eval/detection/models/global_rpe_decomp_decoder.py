@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
 
-from ternarylayers.dinov3.layers.ternarylayers import Linear as BitLinear
+from ternarylayers.dinov3.layers.bitlayers import Linear as BitLinear
 
 from ..util.box_ops import box_xyxy_to_cxcywh, delta2bbox
 from ..util.misc import _get_activation_fn, _get_clones, inverse_sigmoid

@@ -24,7 +24,7 @@ Mostly copy-paste from torchvision references.
 import copy
 from typing import List, Optional
 
-import dinov3.distributed as distributed
+import ternarylayers.dinov3.distributed as distributed
 import torch
 import torch.distributed as dist
 import torch.nn as nn

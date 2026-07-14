@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List
 
-import dinov3.distributed as distributed
+import ternarylayers.dinov3.distributed as distributed
 import torch
 from ternarylayers.dinov3.checkpointer import load_checkpoint, register_dont_save_hooks
 from ternarylayers.dinov3.data import (

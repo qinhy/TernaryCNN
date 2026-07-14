@@ -11,7 +11,7 @@ from collections import defaultdict, deque
 
 import torch
 
-import dinov3.distributed as distributed
+import ternarylayers.dinov3.distributed as distributed
 
 logger = logging.getLogger("dinov3")
 

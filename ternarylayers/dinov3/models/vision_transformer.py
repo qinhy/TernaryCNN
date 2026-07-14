@@ -12,7 +12,7 @@ import torch.nn.init
 from torch import Tensor, nn
 
 from ternarylayers.dinov3.layers import LayerScale, Mlp, PatchEmbed, RMSNorm, RopePositionEmbedding, SelfAttentionBlock, SwiGLUFFN
-from ternarylayers.dinov3.layers.ternarylayers import Linear as BitLinear
+from ternarylayers.dinov3.layers.bitlayers import Linear as BitLinear
 from ternarylayers.dinov3.layers.block import SelfAttentionTRMStage
 from ternarylayers.dinov3.layers.patch_embed import PatchEmbedNoConv
 from ternarylayers.dinov3.utils import named_apply

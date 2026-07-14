@@ -9,7 +9,7 @@ from typing import Any, Callable, List, Optional, Tuple, Union
 import torch
 from torch import Tensor, nn
 
-from ternarylayers.dinov3.layers.ternarylayers import Linear
+from ternarylayers.dinov3.layers.bitlayers import Linear
 from ternarylayers.dinov3.utils import cat_keep_shapes, uncat_with_shapes
 
 from .attention import CausalSelfAttention, SelfAttention

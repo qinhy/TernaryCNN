@@ -10,7 +10,7 @@ import torch
 import torch.utils
 import torch.utils.data
 
-import dinov3.distributed as distributed
+import ternarylayers.dinov3.distributed as distributed
 from ternarylayers.dinov3.logging import MetricLogger
 
 

@@ -8,7 +8,7 @@ from functools import partial
 from typing import Optional, Tuple
 
 import torch
-from ternarylayers.dinov3.layers.ternarylayers import Linear as BitLinear
+from ternarylayers.dinov3.layers.bitlayers import Linear as BitLinear
 from torch import nn
 
 from ternarylayers.dinov3.layers import SelfAttentionBlock, SwiGLUFFN

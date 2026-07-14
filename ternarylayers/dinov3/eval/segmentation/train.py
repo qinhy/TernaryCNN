@@ -13,7 +13,7 @@ import torch
 import torch.distributed as dist
 
 from ternarylayers.dinov3.data import DatasetWithEnumeratedTargets, SamplerType, make_data_loader, make_dataset
-import dinov3.distributed as distributed
+import ternarylayers.dinov3.distributed as distributed
 from ternarylayers.dinov3.eval.segmentation.eval import evaluate_segmentation_model
 from ternarylayers.dinov3.eval.segmentation.loss import MultiSegmentationLoss
 from ternarylayers.dinov3.eval.segmentation.metrics import SEGMENTATION_METRICS

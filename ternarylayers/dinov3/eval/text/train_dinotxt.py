@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 from typing import Callable
 
-import dinov3.distributed as distributed
+import ternarylayers.dinov3.distributed as distributed
 import torch
 from ternarylayers.dinov3.checkpointer import (
     find_latest_checkpoint,

@@ -60,7 +60,7 @@ class ResNetModels:
                 )
         
         def model_post_init(self, context):        
-            in_channels = [64, 128, 256, 512]
+            in_channels = [self.inplanes * (2**stage) for stage in range(4)]
             strides = [1, 2, 2, 2]    
 
             if self.small_stem:
@@ -100,7 +100,7 @@ class ResNetModels:
                     current_in_ch = out_ch
                     
             self.head_pool = PoolModels.AdaptiveAvgPool2d(output_size=1)
-            self.head = LinearModels.Linear(in_features=512 * self.expansion, 
+            self.head = LinearModels.Linear(in_features=in_channels[-1] * self.expansion,
                                             out_features=self.num_classes,
                                             bias=True, scale_op=self.scale_op)
 

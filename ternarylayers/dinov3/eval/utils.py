@@ -14,7 +14,7 @@ import torch
 from torch import nn
 from torchmetrics import Metric
 
-import dinov3.distributed as distributed
+import ternarylayers.dinov3.distributed as distributed
 from ternarylayers.dinov3.data import DatasetWithEnumeratedTargets, SamplerType, make_data_loader
 from ternarylayers.dinov3.eval.accumulators import NoOpAccumulator, ResultsAccumulator
 from ternarylayers.dinov3.logging import MetricLogger

@@ -8,7 +8,7 @@ import warnings
 
 import torch
 import torch.nn.functional as F
-from ternarylayers.dinov3.layers.ternarylayers import Linear as BitLinear
+from ternarylayers.dinov3.layers.bitlayers import Linear as BitLinear
 from torch import nn
 from torch.autograd import Function
 from torch.amp import custom_fwd, custom_bwd

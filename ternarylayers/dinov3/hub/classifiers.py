@@ -17,7 +17,7 @@ from .backbones import (
 )
 
 from .utils import DINOV3_BASE_URL
-from ternarylayers.dinov3.layers.ternarylayers import Linear as BitLinear
+from ternarylayers.dinov3.layers.bitlayers import Linear as BitLinear
 
 
 class ClassifierWeights(Enum):
