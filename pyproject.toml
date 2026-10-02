@@ -57,9 +57,14 @@ dinov3-eval = [
 
 [dependency-groups]
 dev = [
+    "huggingface-hub>=2.1.1",
+    "nvidia-modelopt[cu12]>=0.47.0",
     "pytest>=8.2",
     "pytest-cov>=5",
+    "requests>=2.34.2",
     "ruff>=0.12",
+    "tensorrt-cu12>=11.3.0.99",
+    "torch-tensorrt>=2.13.0",
     "triton-windows>=3.7.1.post27; sys_platform == 'win32'",
     "triton; sys_platform != 'win32'",
 ]

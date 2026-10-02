@@ -1,22 +1,22 @@
-"""
-Common utilities for BitNetCNN implementations.
-This module contains shared components used across different BitNet model implementations.
-"""
+"""Compact BitNetCNN ternary layers with optional int8 reference inference."""
+
 import collections
-from itertools import repeat
 import math
+from itertools import repeat
 from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from ternarylayers.padding import PadSame, get_padding_value
+
+EPS = 1e-12
+
+
 def _ntuple(n, name="parse"):
     def parse(x):
-        if isinstance(x, collections.abc.Iterable):
-            return tuple(x)
-        return tuple(repeat(x, n))
-
+        return tuple(x) if isinstance(x, collections.abc.Iterable) else tuple(repeat(x, n))
     parse.__name__ = name
     return parse
 
@@ -26,697 +26,461 @@ to_2tuple = _pair = _ntuple(2, "_pair")
 _triple = _ntuple(3, "_triple")
 _quadruple = _ntuple(4, "_quadruple")
 
-# Constants
-EPS = 1e-12
 
-# ----------------------------
-# Quantization Utilities
-# ----------------------------
-def _reduce_abs(x: torch.Tensor, keep_dim: int, op: str = "mean") -> torch.Tensor:
-    """
-    Reduce absolute values along all dimensions except keep_dim.
-    Supports mean and median operations.
-    Returns a tensor broadcastable to x with singleton dims in reduced axes.
-    """
-    if keep_dim < 0 or keep_dim >= x.dim():
-        raise ValueError(f"keep_dim={keep_dim} out of range for tensor of dim {x.dim()}")
-    dims = [d for d in range(x.dim()) if d != keep_dim]
-    a = x.abs()
-    if op == "mean":
-        s = a.mean(dim=dims, keepdim=True)
-    elif op == "median":
-        # median over flattened other dims
-        perm = (keep_dim,) + tuple(d for d in range(x.dim()) if d != keep_dim)
-        flat = a.permute(perm).contiguous().view(a.size(keep_dim), -1)
-        s = flat.median(dim=1).values.view([a.size(keep_dim)] + [1] * (x.dim() - 1))
-        inv = [0] * x.dim()
-        for i, p in enumerate(perm):
-            inv[p] = i
-        s = s.permute(*inv).contiguous()
-    else:
-        raise ValueError("op must be 'mean' or 'median'")
-    return s.clamp_min(EPS)
-
-
-# ----------------------------
-# Model-wide conversion helpers
-# ----------------------------
+# -----------------------------------------------------------------------------
+# Quantization helpers
+# -----------------------------------------------------------------------------
 @torch.no_grad()
-def convert_to_ternary(module: nn.Module) -> nn.Module:
-    """
-    Recursively replace Bit.Conv2d/Bit.Linear with their *Infer counterparts, in-place.
+def scale_to_mn(scale: torch.Tensor, multiplier_bits: int = 31):
+    """Approximate scale as M * 2**(-n), with int32 M/n."""
+    if not 1 <= multiplier_bits <= 31:
+        raise ValueError("multiplier_bits must be in [1, 31]")
 
-    Usage:
-        from copy import deepcopy
-        ternary_model = convert_to_ternary(deepcopy(model))
-    """
+    s = torch.as_tensor(scale).detach().to(torch.float64)
+    if torch.any(s < 0):
+        raise ValueError("scale must be non-negative")
+
+    mantissa, exponent = torch.frexp(s)
+    M = torch.round(mantissa * (1 << multiplier_bits)).to(torch.int64)
+    overflow = M == (1 << multiplier_bits)
+    M = torch.where(overflow, M >> 1, M)
+    exponent = torch.where(overflow, exponent + 1, exponent)
+    n = multiplier_bits - exponent
+
+    zero = s == 0
+    M = torch.where(zero, 0, M)
+    n = torch.where(zero, 0, n)
+    return M.to(torch.int32), n.to(torch.int32)
+
+
+def requantize_int32(acc: torch.Tensor, M: torch.Tensor, n: torch.Tensor):
+    """Integer reference: round(acc * M / 2**n)."""
+    if acc.dtype != torch.int32:
+        raise TypeError(f"acc must be torch.int32, got {acc.dtype}")
+
+    prod = acc.to(torch.int64) * torch.as_tensor(M, device=acc.device, dtype=torch.int64)
+    n = torch.as_tensor(n, device=acc.device, dtype=torch.int64)
+    if torch.any(n < 0):
+        raise ValueError("negative shifts are not supported by requantize_int32")
+
+    normal = n < 63
+    safe_n = torch.where(normal, n, 0)
+    rounding = torch.where(
+        normal & (safe_n > 0),
+        torch.bitwise_left_shift(torch.ones_like(safe_n), (safe_n - 1).clamp_min(0)),
+        0,
+    )
+    shifted = torch.bitwise_right_shift(prod.abs() + rounding, safe_n)
+    shifted = torch.where(normal, shifted, 0)
+    return torch.where(prod < 0, -shifted, shifted).to(torch.int32)
+
+
+def quantize_symmetric_int8(x: torch.Tensor, scale: float | torch.Tensor):
+    s = torch.as_tensor(scale, dtype=x.dtype, device=x.device)
+    if torch.any(s <= 0):
+        raise ValueError("scale must be > 0")
+    return torch.round(x / s).clamp(-128, 127).to(torch.int8)
+
+
+def dequantize_symmetric_int8(x_q: torch.Tensor, scale: float | torch.Tensor):
+    s = torch.as_tensor(scale, dtype=torch.float32, device=x_q.device)
+    return x_q.float() * s
+
+
+def _reduce_abs(x: torch.Tensor, keep_dim: int, op: str = "mean"):
+    """Reduce |x| over every dimension except keep_dim, preserving broadcast shape."""
+    if not 0 <= keep_dim < x.dim():
+        raise ValueError(f"keep_dim={keep_dim} out of range for tensor of dim {x.dim()}")
+
+    a = x.abs()
+    dims = [d for d in range(x.dim()) if d != keep_dim]
+    if op == "mean":
+        return a.mean(dim=dims, keepdim=True).clamp_min(EPS)
+    if op != "median":
+        raise ValueError("op must be 'mean' or 'median'")
+
+    perm = (keep_dim, *dims)
+    s = a.permute(perm).contiguous().view(a.size(keep_dim), -1).median(1).values
+    s = s.view(a.size(keep_dim), *([1] * (x.dim() - 1)))
+    inv = [perm.index(i) for i in range(x.dim())]
+    return s.permute(*inv).contiguous().clamp_min(EPS)
+
+
+def _ternary_ste(weight: torch.Tensor, dim=0, scale_op="median"):
+    s = _reduce_abs(weight, keep_dim=dim, op=scale_op)
+    q = torch.round((weight / s).detach()).clamp(-1, 1)
+    return weight + (q * s - weight).detach()
+
+
+def _freeze_ternary(weight: torch.Tensor, scale_op="median"):
+    """Quantize along output dim 0; return ternary q and flat per-output scale."""
+    scale = _reduce_abs(weight, keep_dim=0, op=scale_op).reshape(weight.shape[0])
+    shape = (weight.shape[0],) + (1,) * (weight.dim() - 1)
+    q = torch.round(weight / scale.view(shape)).clamp(-1, 1).to(weight.dtype)
+    return q, scale
+
+
+# -----------------------------------------------------------------------------
+# Integer reference kernels
+# -----------------------------------------------------------------------------
+def _conv2d_int32_reference(x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
+    if x.dtype != torch.int32 or weight.dtype != torch.int32:
+        raise TypeError("x and weight must both be torch.int32")
+
+    dh, dw = to_2tuple(dilation)
+    if (dh, dw) != (1, 1):
+        kh, kw = weight.shape[-2:]
+        expanded = torch.zeros(
+            (*weight.shape[:-2], (kh - 1) * dh + 1, (kw - 1) * dw + 1),
+            dtype=torch.int32,
+            device=weight.device,
+        )
+        expanded[..., ::dh, ::dw] = weight
+        weight = expanded
+
+    return F.conv2d(x, weight, bias, stride, padding, 1, groups)
+
+
+def _conv_transpose2d_int32_reference(
+    x, weight, stride=1, padding=0, output_padding=0, dilation=1, groups=1
+):
+    """ConvTranspose2d via zero insertion + int32 conv2d (reference only)."""
+    if x.dtype != torch.int32 or weight.dtype != torch.int32:
+        raise TypeError("x and weight must both be torch.int32")
+
+    sh, sw = to_2tuple(stride)
+    ph, pw = to_2tuple(padding)
+    oph, opw = to_2tuple(output_padding)
+    dh, dw = to_2tuple(dilation)
+    kh, kw = weight.shape[-2:]
+    if oph >= sh or opw >= sw:
+        raise ValueError("output_padding must be smaller than stride")
+
+    n, cin, h, w = x.shape
+    up = torch.zeros((n, cin, (h - 1) * sh + 1, (w - 1) * sw + 1), dtype=torch.int32, device=x.device)
+    up[:, :, ::sh, ::sw] = x
+
+    pt, pl = dh * (kh - 1) - ph, dw * (kw - 1) - pw
+    pb, pr = pt + oph, pl + opw
+    ct, cb, cl, cr = max(-pt, 0), max(-pb, 0), max(-pl, 0), max(-pr, 0)
+    if ct or cb or cl or cr:
+        he = up.shape[-2] - cb if cb else up.shape[-2]
+        we = up.shape[-1] - cr if cr else up.shape[-1]
+        up = up[:, :, ct:he, cl:we]
+
+    pt, pb, pl, pr = max(pt, 0), max(pb, 0), max(pl, 0), max(pr, 0)
+    if pt or pb or pl or pr:
+        up = F.pad(up, (pl, pr, pt, pb))
+
+    cin_g, cout_g = cin // groups, weight.shape[1]
+    w_conv = (
+        weight.view(groups, cin_g, cout_g, kh, kw)
+        .permute(0, 2, 1, 3, 4).flip(-1, -2).contiguous()
+        .view(groups * cout_g, cin_g, kh, kw)
+    )
+    return _conv2d_int32_reference(up, w_conv, dilation=dilation, groups=groups)
+
+
+# -----------------------------------------------------------------------------
+# Shared inference behavior
+# -----------------------------------------------------------------------------
+class _IntegerInferMixin:
+    save_dtype = torch.int8
+
+    def _init_frozen(self, weight, scale, bias):
+        self.weight = nn.Parameter(weight, requires_grad=False)
+        self.scale = nn.Parameter(scale, requires_grad=False)
+        self.bias = nn.Parameter(bias, requires_grad=False) if bias is not None else None
+        for name in ("requant_M", "requant_n", "bias_int32"):
+            self.register_buffer(name, None)
+        self.input_scale = self.output_scale = None
+
+    @property
+    def _out_count(self):
+        return getattr(self, "out_channels", getattr(self, "out_features", None))
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        if self.save_dtype == torch.int8 and torch.any((self.weight.data > 127) | (self.weight.data < -128)):
+            raise ValueError("weight.data is not in (-128, 127)")
+        self.weight.data = self.weight.data.to(self.save_dtype)
+        super()._save_to_state_dict(destination, prefix, keep_vars)
+
+    @torch.no_grad()
+    def prepare_integer(self, input_scale, output_scale, multiplier_bits: int = 31):
+        device = self.scale.device
+        sx = torch.as_tensor(input_scale, dtype=torch.float64, device=device)
+        sy = torch.as_tensor(output_scale, dtype=torch.float64, device=device)
+        if sx.numel() != 1 or sy.numel() != 1:
+            raise ValueError("input_scale and output_scale must be scalar")
+        if sx.item() <= 0 or sy.item() <= 0:
+            raise ValueError("input_scale and output_scale must be > 0")
+
+        sw = self.scale.detach().reshape(-1).to(torch.float64)
+        if sw.numel() != self._out_count:
+            raise ValueError(f"expected {self._out_count} weight scales, got {sw.numel()}")
+
+        self.requant_M, self.requant_n = [t.to(device) for t in scale_to_mn(sx * sw / sy, multiplier_bits)]
+        if self.bias is None:
+            self.bias_int32 = None
+        else:
+            bias_q = torch.round(self.bias.detach().double() / (sx * sw)).to(torch.int64)
+            i32 = torch.iinfo(torch.int32)
+            if torch.any((bias_q < i32.min) | (bias_q > i32.max)):
+                raise OverflowError("quantized bias does not fit int32")
+            self.bias_int32 = bias_q.to(device=device, dtype=torch.int32)
+
+        self.input_scale, self.output_scale = float(sx.item()), float(sy.item())
+        return self
+
+    def _check_integer_input(self, x):
+        if x.dtype != torch.int8:
+            raise TypeError(f"forward_integer expects torch.int8 input, got {x.dtype}")
+        if self.requant_M is None or self.requant_n is None:
+            raise RuntimeError("integer metadata is not prepared; call prepare_integer(input_scale, output_scale) first")
+
+    def _finish_integer(self, acc, x, channel_shape):
+        if acc.dtype != torch.int32:
+            acc = acc.to(torch.int32)
+        if self.bias_int32 is not None:
+            acc = acc + self.bias_int32.to(x.device).view(channel_shape)
+        M = self.requant_M.to(x.device).view(channel_shape)
+        n = self.requant_n.to(x.device).view(channel_shape)
+        return requantize_int32(acc, M, n).clamp(-128, 127).to(torch.int8)
+
+
+def convert_to_ternary(module: nn.Module):
+    """Recursively replace layers exposing to_ternary(), in-place."""
     if hasattr(module, "to_ternary"):
         return module.to_ternary()
-
     for name, child in list(module.named_children()):
-        if hasattr(child, "to_ternary"):
-            setattr(module, name, child.to_ternary())
-        else:
-            convert_to_ternary(child)
+        setattr(module, name, child.to_ternary()) if hasattr(child, "to_ternary") else convert_to_ternary(child)
     return module
 
 
-# ----------------------------
-# Bit Quantization Classes
-# ----------------------------
+# -----------------------------------------------------------------------------
+# Public API
+# -----------------------------------------------------------------------------
 class Bit:
-    """
-    Collection of classes for bit-level quantization of neural networks.
-    Includes fake-quant building blocks, inference modules, and training modules.
-    """
-
     class functional:
-        @staticmethod
-        def bit1p58_weight(
-            weight: torch.Tensor,
-            dim: int = 0,
-            scale_op: str = "median",
-        ) -> torch.Tensor:
-            """
-            Fake-quant ternary weights (~1.58 bits) with STE,
-            using per-channel scale from |w| reduction.
-            """
-            s = _reduce_abs(weight, keep_dim=dim, op=scale_op)
-            w_bar = (weight / s).detach()
-            w_q = torch.round(w_bar)
-            w_q = w_q.clamp(-1, 1)
-            # STE: pass-through gradient
-            return weight + (w_q * s - weight).detach()
+        bit1p58_weight = staticmethod(_ternary_ste)
 
         @staticmethod
-        def conv2d(
-            input: torch.Tensor,
-            weight: torch.Tensor,
-            bias=None,
-            stride=1,
-            padding=0,
-            padding_mode: str = "zeros",
-            dilation=1,
-            groups=1,
-            dim: int = 0,
-            scale_op: str = "median",
-        ) -> torch.Tensor:
-            """
-            Conv2d with fake-quant ternary weights (STE). Supports padding_mode
-            similar to nn.Conv2d when padding_mode != "zeros".
-            """
-            weight = Bit.functional.bit1p58_weight(weight, dim, scale_op)
-
-            # Emulate nn.Conv2d behavior for padding_mode != 'zeros'
+        def conv2d(input, weight, bias=None, stride=1, padding=0, padding_mode="zeros",
+                   dilation=1, groups=1, dim=0, scale_op="median"):
+            weight = _ternary_ste(weight, dim, scale_op)
             if padding_mode != "zeros" and padding != 0:
                 if isinstance(padding, int):
-                    pad = (padding, padding, padding, padding)  # left, right, top, bottom
+                    pad = (padding,) * 4
                 elif isinstance(padding, tuple) and len(padding) == 2:
-                    pad_h, pad_w = padding
-                    pad = (pad_w, pad_w, pad_h, pad_h)
+                    ph, pw = padding
+                    pad = (pw, pw, ph, ph)
                 else:
                     raise ValueError(f"Unsupported padding={padding} for padding_mode='{padding_mode}'")
-                input = F.pad(input, pad, mode=padding_mode)
-                padding_eff = 0
-            else:
-                padding_eff = padding
-
-            return F.conv2d(
-                input,
-                weight,
-                bias,
-                stride=stride,
-                padding=padding_eff,
-                dilation=dilation,
-                groups=groups,
-            )
+                input, padding = F.pad(input, pad, mode=padding_mode), 0
+            return F.conv2d(input, weight, bias, stride, padding, dilation, groups)
 
         @staticmethod
-        def linear(
-            input: torch.Tensor,
-            weight: torch.Tensor,
-            bias=None,
-            dim: int = 0,
-            scale_op: str = "median",
-        ) -> torch.Tensor:
-            weight = Bit.functional.bit1p58_weight(weight, dim, scale_op)
-            return F.linear(input, weight, bias)
+        def linear(input, weight, bias=None, dim=0, scale_op="median"):
+            return F.linear(input, _ternary_ste(weight, dim, scale_op), bias)
 
-    # ------------------------------------------------------------------
-    # CommonConv2d: shared conv implementation with SAME padding
-    # ------------------------------------------------------------------
     class CommonConv2d(nn.Module):
-        """
-        Shared conv2d implementation that supports:
-        - 'same' / 'valid' / int / tuple paddings via ternarylayers.padding
-        - Optional dynamic SAME padding (PadSame)
-        Subclasses must implement:
-        - init_weights(...)
-        - get_weights(dtype, device) -> (weight, scale or None)
-
-        IMPORTANT SEMANTICS (to match your old working code):
-        - Training (scale is None):  y = Conv(x, Wq, bias)
-        - Inference (scale is not None):
-              y = Conv(x, Wq, bias=None)
-              y = y * scale
-              if bias is not None: y = y + bias
-          i.e., **bias is NOT scaled**.
-        """
-
-        def __init__(
-            self,
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride=1,
-            padding=0,          # can be int, tuple, 'same', 'valid'
-            padding_mode: str = "zeros",
-            dilation=1,
-            groups=1,
-            bias: bool = True,
-            scale_op: str = "median",
-        ):
+        """Shared padding, float forward, and inference scale/bias semantics."""
+        def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0,
+                     padding_mode="zeros", dilation=1, groups=1, bias=True, scale_op="median"):
             super().__init__()
-            kh, kw = to_2tuple(kernel_size)
-            self.in_channels = in_channels
-            self.out_channels = out_channels
-            self.kernel_size = (kh, kw)
-            self.stride = to_2tuple(stride)
-            self.dilation = to_2tuple(dilation)
-            self.padding = padding           # original user argument
-            self.padding_mode = padding_mode
-            self.scale_op = scale_op
-            self.groups = groups
-
-            # Resolve static vs dynamic SAME padding using your ternarylayers.padding utilities
+            self.in_channels, self.out_channels = in_channels, out_channels
+            self.kernel_size = to_2tuple(kernel_size)
+            self.stride, self.dilation = to_2tuple(stride), to_2tuple(dilation)
+            self.padding, self.padding_mode = padding, padding_mode
+            self.groups, self.scale_op, self.bias = groups, scale_op, None
             self.padding_value, self.dynamic_pad = get_padding_value(
-                padding,
-                kernel_size=self.kernel_size,
-                stride=self.stride,
-                dilation=self.dilation,
+                padding, kernel_size=self.kernel_size, stride=self.stride, dilation=self.dilation
             )
+            self.pad_layer = PadSame(self.kernel_size, self.stride, self.dilation) if self.dynamic_pad else None
 
-            if self.dynamic_pad:
-                self.pad_layer = PadSame(self.kernel_size, self.stride, self.dilation)
-            else:
-                self.pad_layer = None
-
-            # Placeholder; subclasses will create real Parameters
-            self.bias = None
-
-        # --- abstract-ish API for subclasses ---
-        def get_weights(self, dtype: torch.dtype, device: torch.device):
-            """
-            Return (weight, scale_or_None).
-            - For training Conv2d: (w_q, None)
-            - For inference Conv2dInfer: (weight_float, scale)
-            """
+        def get_weights(self, dtype, device):
             raise NotImplementedError
 
-        def init_weights(self, *args, **kwargs):
-            raise NotImplementedError
+        def _pad(self, x):
+            return (self.pad_layer(x), 0) if self.dynamic_pad else (x, self.padding_value)
 
-        # --- shared forward ---
-        def forward(self, x: torch.Tensor,
-                    weight: Optional[torch.Tensor]=None,
-                    bias: Optional[torch.Tensor]=None):
+        def _op(self, x, weight, bias, padding):
+            return F.conv2d(x, weight, bias, self.stride, padding, self.dilation, self.groups)
+
+        def forward(self, x, weight: Optional[torch.Tensor] = None, bias: Optional[torch.Tensor] = None):
             scale = None
             if weight is None:
                 weight, scale = self.get_weights(x.dtype, x.device)
-
-            if self.dynamic_pad:
-                x = self.pad_layer(x)
-                padding_value = 0
-            else:
-                padding_value = self.padding_value
-
-            bias = self.bias if scale is None else None
-
-            y = F.conv2d(
-                x,
-                weight,
-                bias=bias,
-                stride=self.stride,
-                padding=padding_value,
-                dilation=self.dilation,
-                groups=self.groups,
-            )
-
+            x, padding = self._pad(x)
+            y = self._op(x, weight, self.bias if scale is None else None, padding)
             if scale is not None:
                 y = y * scale
                 if self.bias is not None:
                     y = y + self.bias.view(1, -1, 1, 1)
-
             return y
 
-    # ------------------------------------------------------------------
-    # Fake-quant building block (QAT) — weight only
-    # ------------------------------------------------------------------
+    class CommonConvTranspose2d(CommonConv2d):
+        def __init__(self, *args, output_padding=0, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.output_padding = to_2tuple(output_padding)
+
+        def _op(self, x, weight, bias, padding):
+            return F.conv_transpose2d(
+                x, weight, bias, self.stride, padding, self.output_padding, self.groups, self.dilation
+            )
+
     class Bit1p58Weight(nn.Module):
-        """1.58-bit (ternary) weight quantizer with per-out-channel scaling."""
-
-        def __init__(self, dim: int = 0, scale_op: str = "median"):
+        def __init__(self, dim=0, scale_op="median"):
             super().__init__()
-            self.dim = dim
-            self.scale_op = scale_op
+            self.dim, self.scale_op = dim, scale_op
 
-        def forward(self, w: torch.Tensor) -> torch.Tensor:
-            s = _reduce_abs(w, keep_dim=self.dim, op=self.scale_op)
-            w_bar = (w / s).detach()
-            w_q = torch.round(w_bar)
-            w_q = w_q.clamp(-1, 1)
-            return w + (w_q * s - w).detach()
+        def forward(self, w):
+            return _ternary_ste(w, self.dim, self.scale_op)
 
-    # ------------------------------------------------------------------
-    # Train-time Conv2d (fake-quant weights) with SAME support
-    # ------------------------------------------------------------------
     class Conv2d(CommonConv2d):
-        """
-        Conv2d with ternary weights (fake-quant for training).
-        This keeps the old Bit.Conv2d API, but adds SAME padding support.
-
-        Old API compatibility:
-            Bit.Conv2d(in_c, out_c, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True, scale_op="median")
-        New extras:
-            - padding can now also be 'same', 'valid', etc. as supported by ternarylayers.padding.
-            - padding_mode (for non-zero padding) is available but optional.
-        """
-        def __init__(
-            self,
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride=1,
-            padding=0,          # can be int, tuple, 'same', 'valid'
-            padding_mode: str = "zeros",
-            dilation=1,
-            groups=1,
-            bias: bool = True,
-            scale_op: str = "median",
-        ):
-            super().__init__(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                kernel_size=kernel_size,
-                stride=stride,
-                padding=padding,
-                padding_mode=padding_mode,
-                dilation=dilation,
-                groups=groups,
-                bias=bias,
-                scale_op=scale_op,
-            )
-            self.init_weights(bias)
-
-        def init_weights(self, bias: bool):
+        def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0,
+                     padding_mode="zeros", dilation=1, groups=1, bias=True, scale_op="median"):
+            super().__init__(in_channels, out_channels, kernel_size, stride, padding,
+                             padding_mode, dilation, groups, bias, scale_op)
             kh, kw = self.kernel_size
-            self.weight = nn.Parameter(
-                torch.empty(self.out_channels, self.in_channels // self.groups, kh, kw)
-            )
+            self.weight = nn.Parameter(torch.empty(out_channels, in_channels // groups, kh, kw))
             nn.init.kaiming_normal_(self.weight, nonlinearity="relu")
-            self.bias = nn.Parameter(torch.zeros(self.out_channels)) if bias else None
-            self.w_q = Bit.Bit1p58Weight(dim=0, scale_op=self.scale_op)
+            self.bias = nn.Parameter(torch.zeros(out_channels)) if bias else None
+            self.w_q = Bit.Bit1p58Weight(0, scale_op)
 
-        def get_weights(self, dtype: torch.dtype, device: torch.device):
-            # Fake-quant weights for training, no separate scale factor
-            wq = self.w_q(self.weight).to(dtype=dtype, device=device)
-            return wq, None
+        def get_weights(self, dtype, device):
+            return self.w_q(self.weight).to(dtype=dtype, device=device), None
 
         @torch.no_grad()
         def to_ternary(self, dtype=torch.int8):
-            """
-            Convert this layer into a frozen Bit.Conv2dInfer, carrying over:
-            - per-out-channel weight scale `s` and Wq in {-1,0,+1},
-            - SAME padding behavior (via CommonConv2d) preserved.
-            """
-            w = self.weight.data
-            s_vec = _reduce_abs(w, keep_dim=0, op=self.scale_op).squeeze()  # [out]
-            s = s_vec.view(-1, 1, 1)                                        # [out,1,1] for conv broadcast
-            w_bar = w / s_vec.view(-1, 1, 1, 1)
-            w_q = torch.round(w_bar).to(w.dtype)
-            w_q = w_q.clamp(-1, 1)
-
+            q, s = _freeze_ternary(self.weight.data, self.scale_op)
             return Bit.Conv2dInfer(
-                weight=w_q.to(dtype=torch.int8) if dtype else w_q,
-                scale=s,
-                bias=(None if self.bias is None else self.bias.data.clone()),
-                in_channels=self.in_channels,
-                out_channels=self.out_channels,
-                kernel_size=self.kernel_size,
-                stride=self.stride,
-                padding=self.padding,
-                padding_mode=self.padding_mode,
-                dilation=self.dilation,
-                groups=self.groups,
-                scale_op=self.scale_op,
-            ).to(device=self.weight.device,dtype=self.weight.dtype)
+                q.to(torch.int8) if dtype else q, s.view(-1, 1, 1),
+                None if self.bias is None else self.bias.data.clone(),
+                self.in_channels, self.out_channels, self.kernel_size,
+                self.stride, self.padding, self.padding_mode, self.dilation, self.groups, self.scale_op,
+            ).to(self.weight.device)
 
-    # ------------------------------------------------------------------
-    # Inference Conv2d (frozen ternary)
-    # ------------------------------------------------------------------
-    class Conv2dInfer(CommonConv2d):
-        """
-        Frozen ternary conv:
-            y = Conv(x, Wq) * s_per_out + b
-        where:
-            - Wq in {-1,0,+1} stored as int8,
-            - s_per_out is float per output channel (shape [out,1,1]),
-            - bias is *not* scaled by s.
-        """
+    class Conv2dInfer(_IntegerInferMixin, CommonConv2d):
+        def __init__(self, weight, scale, bias, in_channels, out_channels, kernel_size,
+                     stride=1, padding=0, padding_mode="zeros", dilation=1, groups=1, scale_op="median"):
+            super().__init__(in_channels, out_channels, kernel_size, stride, padding,
+                             padding_mode, dilation, groups, bias is not None, scale_op)
+            self._init_frozen(weight, scale, bias)
 
-        def __init__(
-            self,
-            weight: torch.Tensor,
-            scale: torch.Tensor,
-            bias: torch.Tensor,
-            in_channels: int,
-            out_channels: int,
-            kernel_size,
-            stride=1,
-            padding=0,
-            padding_mode: str = "zeros",
-            dilation=1,
-            groups=1,
-            scale_op: str = "median",
-        ):
-            super().__init__(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                kernel_size=kernel_size,
-                stride=stride,
-                padding=padding,
-                padding_mode=padding_mode,
-                dilation=dilation,
-                groups=groups,
-                bias=True if bias is not None else False,
-                scale_op=scale_op,
+        def get_weights(self, dtype, device):
+            return self.weight.to(device=device, dtype=dtype), self.scale.to(device=device)
+
+        def forward_integer(self, x):
+            self._check_integer_input(x)
+            x, padding = self._pad(x)
+            acc = _conv2d_int32_reference(
+                x.int(), self.weight.to(device=x.device, dtype=torch.int32),
+                stride=self.stride, padding=padding, dilation=self.dilation, groups=self.groups,
             )
-            self.save_dtype = torch.int8
-            self.init_weights(bias, weight, scale)
+            return self._finish_integer(acc, x, (1, -1, 1, 1))
 
-        # ---- custom save / load hooks ----
-        def _save_to_state_dict(self, destination, prefix, keep_vars):
-            if self.save_dtype==torch.int8 and (
-                (self.weight.data>127).sum() + (self.weight.data<-128).sum()>0):
-                raise ValueError("weight.data is not in (-128, 127)")
-            self.weight.data = self.weight.data.to(self.save_dtype)
-            # let nn.Module save everything as usual
-            super()._save_to_state_dict(destination, prefix, keep_vars)
+        forward_int8 = forward_integer
 
-        def init_weights(self, bias, weight: torch.Tensor, scale: torch.Tensor):
-            # Make them Parameters so param counters include them (but keep frozen)
-            self.weight = nn.Parameter(weight, requires_grad=False) # [out,in,kh,kw]
-            self.scale  = nn.Parameter(scale, requires_grad=False)  # [out,1,1]
-            self.bias = bias if bias is None else nn.Parameter(bias, requires_grad=False) # [out]
-
-        def get_weights(self, dtype: torch.dtype, device: torch.device):
-            return self.weight.to(dtype=dtype), self.scale
-
-    # ------------------------------------------------------------------
-    # Train-time ConvTranspose2d (fake-quant weights)
-    # ------------------------------------------------------------------
-    class ConvTranspose2d(CommonConv2d):
-        """
-        ConvTranspose2d with ternary weights (fake-quant for training).
-        Signature follows nn.ConvTranspose2d, with SAME padding support
-        via CommonConv2d padding utilities.
-        """
-        def __init__(
-            self,
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride=1,
-            padding=0,
-            output_padding=0,
-            padding_mode: str = "zeros",
-            dilation=1,
-            groups=1,
-            bias: bool = True,
-            scale_op: str = "median",
-        ):
-            super().__init__(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                kernel_size=kernel_size,
-                stride=stride,
-                padding=padding,
-                padding_mode=padding_mode,
-                dilation=dilation,
-                groups=groups,
-                bias=bias,
-                scale_op=scale_op,
-            )
-            self.output_padding = to_2tuple(output_padding)
-            self.init_weights(bias)
-
-        def init_weights(self, bias: bool):
+    class ConvTranspose2d(CommonConvTranspose2d):
+        def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0,
+                     output_padding=0, padding_mode="zeros", dilation=1, groups=1,
+                     bias=True, scale_op="median"):
+            super().__init__(in_channels, out_channels, kernel_size, stride, padding,
+                             padding_mode, dilation, groups, bias, scale_op,
+                             output_padding=output_padding)
             kh, kw = self.kernel_size
-            self.weight = nn.Parameter(
-                torch.empty(self.in_channels, self.out_channels // self.groups, kh, kw)
-            )
+            self.weight = nn.Parameter(torch.empty(in_channels, out_channels // groups, kh, kw))
             nn.init.kaiming_normal_(self.weight, nonlinearity="relu")
-            self.bias = nn.Parameter(torch.zeros(self.out_channels)) if bias else None
+            self.bias = nn.Parameter(torch.zeros(out_channels)) if bias else None
 
-        def _reshape_weight_to_out(self, weight: torch.Tensor) -> torch.Tensor:
-            # Reorder to (out_channels, in_channels_per_group, kh, kw) for per-out quantization
-            g = self.groups
-            in_per = self.in_channels // g
-            out_per = self.out_channels // g
-            kh, kw = self.kernel_size
-            w_view = weight.view(g, in_per, out_per, kh, kw)
-            w_view = w_view.permute(0, 2, 1, 3, 4).contiguous()
-            return w_view.view(self.out_channels, in_per, kh, kw)
+        def _weight_to_out(self, w):
+            g, kh, kw = self.groups, *self.kernel_size
+            ip, op = self.in_channels // g, self.out_channels // g
+            return w.view(g, ip, op, kh, kw).permute(0, 2, 1, 3, 4).contiguous().view(self.out_channels, ip, kh, kw)
 
-        def _reshape_weight_from_out(self, weight: torch.Tensor) -> torch.Tensor:
-            # Inverse of _reshape_weight_to_out
-            g = self.groups
-            in_per = self.in_channels // g
-            out_per = self.out_channels // g
-            kh, kw = self.kernel_size
-            w_view = weight.view(g, out_per, in_per, kh, kw)
-            w_view = w_view.permute(0, 2, 1, 3, 4).contiguous()
-            return w_view.view(self.in_channels, out_per, kh, kw)
+        def _weight_from_out(self, w):
+            g, kh, kw = self.groups, *self.kernel_size
+            ip, op = self.in_channels // g, self.out_channels // g
+            return w.view(g, op, ip, kh, kw).permute(0, 2, 1, 3, 4).contiguous().view(self.in_channels, op, kh, kw)
 
-        def get_weights(self, dtype: torch.dtype, device: torch.device):
-            w = self._reshape_weight_to_out(self.weight)
-            s = _reduce_abs(w, keep_dim=0, op=self.scale_op)
-            w_bar = (w / s).detach()
-            w_q = torch.round(w_bar).clamp(-1, 1)
-            w_q = w + (w_q * s - w).detach()
-            w_q = self._reshape_weight_from_out(w_q)
-            return w_q.to(dtype=dtype, device=device), None
-
-        def forward(
-            self,
-            x: torch.Tensor,
-            weight: Optional[torch.Tensor] = None,
-            bias: Optional[torch.Tensor] = None,
-        ):
-            scale = None
-            if weight is None:
-                weight, scale = self.get_weights(x.dtype, x.device)
-
-            if self.dynamic_pad:
-                x = self.pad_layer(x)
-                padding_value = 0
-            else:
-                padding_value = self.padding_value
-
-            bias = self.bias if scale is None else None
-
-            y = F.conv_transpose2d(
-                x,
-                weight,
-                bias=bias,
-                stride=self.stride,
-                padding=padding_value,
-                output_padding=self.output_padding,
-                dilation=self.dilation,
-                groups=self.groups,
-            )
-
-            if scale is not None:
-                y = y * scale
-                if self.bias is not None:
-                    y = y + self.bias.view(1, -1, 1, 1)
-
-            return y
+        def get_weights(self, dtype, device):
+            w = self._weight_to_out(self.weight)
+            return self._weight_from_out(_ternary_ste(w, 0, self.scale_op)).to(dtype=dtype, device=device), None
 
         @torch.no_grad()
         def to_ternary(self, dtype=torch.int8):
-            w = self.weight.data
-            w_view = self._reshape_weight_to_out(w)
-            s_vec = _reduce_abs(w_view, keep_dim=0, op=self.scale_op).squeeze()
-            s = s_vec.view(-1, 1, 1)
-            w_bar = w_view / s_vec.view(-1, 1, 1, 1)
-            w_q = torch.round(w_bar).clamp(-1, 1).to(w.dtype)
-            w_q = self._reshape_weight_from_out(w_q)
+            q, s = _freeze_ternary(self._weight_to_out(self.weight.data), self.scale_op)
+            q = self._weight_from_out(q)
             return Bit.ConvTranspose2dInfer(
-                weight=w_q.to(dtype=torch.int8) if dtype else w_q,
-                scale=s,
-                bias=(None if self.bias is None else self.bias.data.clone()),
-                in_channels=self.in_channels,
-                out_channels=self.out_channels,
-                kernel_size=self.kernel_size,
-                stride=self.stride,
-                padding=self.padding,
-                output_padding=self.output_padding,
-                padding_mode=self.padding_mode,
-                dilation=self.dilation,
-                groups=self.groups,
-                scale_op=self.scale_op,
-            ).to(device=self.weight.device, dtype=self.weight.dtype)
+                q.to(torch.int8) if dtype else q, s.view(-1, 1, 1),
+                None if self.bias is None else self.bias.data.clone(),
+                self.in_channels, self.out_channels, self.kernel_size,
+                self.stride, self.padding, self.output_padding, self.padding_mode,
+                self.dilation, self.groups, self.scale_op,
+            ).to(self.weight.device)
 
-    # ------------------------------------------------------------------
-    # Inference ConvTranspose2d (frozen ternary)
-    # ------------------------------------------------------------------
-    class ConvTranspose2dInfer(CommonConv2d):
-        """
-        Frozen ternary conv transpose:
-            y = ConvTranspose(x, Wq) * s_per_out + b
-        """
+    class ConvTranspose2dInfer(_IntegerInferMixin, CommonConvTranspose2d):
+        def __init__(self, weight, scale, bias, in_channels, out_channels, kernel_size,
+                     stride=1, padding=0, output_padding=0, padding_mode="zeros",
+                     dilation=1, groups=1, scale_op="median"):
+            super().__init__(in_channels, out_channels, kernel_size, stride, padding,
+                             padding_mode, dilation, groups, bias is not None, scale_op,
+                             output_padding=output_padding)
+            self._init_frozen(weight, scale, bias)
 
-        def __init__(
-            self,
-            weight: torch.Tensor,
-            scale: torch.Tensor,
-            bias: torch.Tensor,
-            in_channels: int,
-            out_channels: int,
-            kernel_size,
-            stride=1,
-            padding=0,
-            output_padding=0,
-            padding_mode: str = "zeros",
-            dilation=1,
-            groups=1,
-            scale_op: str = "median",
-        ):
-            super().__init__(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                kernel_size=kernel_size,
-                stride=stride,
-                padding=padding,
-                padding_mode=padding_mode,
-                dilation=dilation,
-                groups=groups,
-                bias=True if bias is not None else False,
-                scale_op=scale_op,
+        def get_weights(self, dtype, device):
+            return self.weight.to(device=device, dtype=dtype), self.scale.to(device=device)
+
+        def forward_integer(self, x):
+            self._check_integer_input(x)
+            x, padding = self._pad(x)
+            acc = _conv_transpose2d_int32_reference(
+                x.int(), self.weight.to(device=x.device, dtype=torch.int32),
+                self.stride, padding, self.output_padding, self.dilation, self.groups,
             )
-            self.output_padding = to_2tuple(output_padding)
-            self.save_dtype = torch.int8
-            self.init_weights(bias, weight, scale)
+            return self._finish_integer(acc, x, (1, -1, 1, 1))
 
-        # ---- custom save / load hooks ----
-        def _save_to_state_dict(self, destination, prefix, keep_vars):
-            if self.save_dtype == torch.int8 and (
-                (self.weight.data > 127).sum() + (self.weight.data < -128).sum() > 0
-            ):
-                raise ValueError("weight.data is not in (-128, 127)")
-            self.weight.data = self.weight.data.to(self.save_dtype)
-            super()._save_to_state_dict(destination, prefix, keep_vars)
+        forward_int8 = forward_integer
 
-        def init_weights(self, bias, weight: torch.Tensor, scale: torch.Tensor):
-            self.weight = nn.Parameter(weight, requires_grad=False)
-            self.scale = nn.Parameter(scale, requires_grad=False)
-            self.bias = bias if bias is None else nn.Parameter(bias, requires_grad=False)
-
-        def get_weights(self, dtype: torch.dtype, device: torch.device):
-            return self.weight.to(dtype=dtype), self.scale
-
-        def forward(
-            self,
-            x: torch.Tensor,
-            weight: Optional[torch.Tensor] = None,
-            bias: Optional[torch.Tensor] = None,
-        ):
-            scale = None
-            if weight is None:
-                weight, scale = self.get_weights(x.dtype, x.device)
-
-            if self.dynamic_pad:
-                x = self.pad_layer(x)
-                padding_value = 0
-            else:
-                padding_value = self.padding_value
-
-            bias = self.bias if scale is None else None
-
-            y = F.conv_transpose2d(
-                x,
-                weight,
-                bias=bias,
-                stride=self.stride,
-                padding=padding_value,
-                output_padding=self.output_padding,
-                dilation=self.dilation,
-                groups=self.groups,
-            )
-
-            if scale is not None:
-                y = y * scale
-                if self.bias is not None:
-                    y = y + self.bias.view(1, -1, 1, 1)
-
-            return y
-
-    # ------------------------------------------------------------------
-    # Train-time Linear & Inference Linear (unchanged from old working code)
-    # ------------------------------------------------------------------
     class Linear(nn.Module):
-        def __init__(self, in_f: int, out_f: int, bias: bool = True, scale_op: str = "median"):
+        def __init__(self, in_f, out_f, bias=True, scale_op="median"):
             super().__init__()
-            self.in_features = in_f
-            self.out_features = out_f
+            self.in_features, self.out_features, self.scale_op = in_f, out_f, scale_op
             self.weight = nn.Parameter(torch.empty(out_f, in_f))
             nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
             self.bias = nn.Parameter(torch.zeros(out_f)) if bias else None
-            self.w_q = Bit.Bit1p58Weight(dim=0, scale_op=scale_op)
-            self.scale_op = scale_op
+            self.w_q = Bit.Bit1p58Weight(0, scale_op)
 
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            wq = self.w_q(self.weight)
-            return F.linear(x, wq, self.bias)
+        def forward(self, x):
+            return F.linear(x, self.w_q(self.weight), self.bias)
 
         @torch.no_grad()
         def to_ternary(self, dtype=torch.int8):
-            w = self.weight.data
-            s = _reduce_abs(w, keep_dim=0, op=self.scale_op).squeeze()  # [out]
-            w_q = torch.round(w / s.view(-1, 1)).clamp(-1, 1).to(w.dtype)
-            bias = None if self.bias is None else self.bias.data.clone()
-            w_q = w_q.to(dtype=torch.int8) if dtype else w_q
-            return Bit.LinearInfer(in_f=self.in_features, out_f=self.out_features, 
-                                   weight=w_q, scale=s, bias=bias,
-                                ).to(device=self.weight.device,dtype=self.weight.dtype)
+            q, s = _freeze_ternary(self.weight.data, self.scale_op)
+            return Bit.LinearInfer(
+                self.in_features, self.out_features,
+                q.to(torch.int8) if dtype else q, s,
+                None if self.bias is None else self.bias.data.clone(),
+            ).to(self.weight.device)
 
-    class LinearInfer(nn.Module):
-        """Frozen ternary linear: y = (x @ Wq^T) * s + b"""
-        def __init__(self, in_f: int, out_f: int, weight: torch.Tensor, scale: torch.Tensor, bias):
+    class LinearInfer(_IntegerInferMixin, nn.Module):
+        def __init__(self, in_f, out_f, weight, scale, bias):
             super().__init__()
-            self.in_features = in_f
-            self.out_features = out_f
-            self.weight = nn.Parameter(weight, requires_grad=False)
-            self.scale = nn.Parameter(scale, requires_grad=False)
-            self.bias = nn.Parameter(bias, requires_grad=False) if bias is not None else None
-            self.save_dtype = torch.int8
+            self.in_features, self.out_features = in_f, out_f
+            self._init_frozen(weight, scale, bias)
 
-        # ---- custom save / load hooks ----
-        def _save_to_state_dict(self, destination, prefix, keep_vars):
-            if self.save_dtype==torch.int8 and (
-                (self.weight.data>127).sum() + (self.weight.data<-128).sum()>0):
-                raise ValueError("weight.data is not in (-128, 127)")
-            self.weight.data = self.weight.data.to(self.save_dtype)
-            # let nn.Module save everything as usual
-            super()._save_to_state_dict(destination, prefix, keep_vars)
+        def forward(self, x):
+            y = F.linear(x, self.weight.to(device=x.device, dtype=x.dtype)) * self.scale.to(x.device)
+            return y if self.bias is None else y + self.bias.to(x.device)
 
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            w = self.weight.to(dtype=x.dtype)
-            y = F.linear(x, w, bias=None) * self.scale
-            if self.bias is not None:
-                y = y + self.bias
-            return y
+        def forward_integer(self, x):
+            self._check_integer_input(x)
+            acc = F.linear(x.int(), self.weight.to(device=x.device, dtype=torch.int32))
+            shape = (1,) * (acc.dim() - 1) + (-1,)
+            return self._finish_integer(acc, x, shape)
+
+        forward_int8 = forward_integer
 
     # For debugging you can switch back to full-precision:
     # class Conv2d(nn.Conv2d): pass

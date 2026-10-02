@@ -10,3 +10,5 @@ dist/
 build/
 /.uv-tmp
 .python-version
+*.pt
+*.ep
