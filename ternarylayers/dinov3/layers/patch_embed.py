@@ -146,6 +146,13 @@ class PatchEmbedNoConv(nn.Module):
         x = x.reshape(B, C, Hp, pH, Wp, pW)
         x = x.permute(0, 2, 4, 1, 3, 5).reshape(B, Hp * Wp, C * pH * pW)
 
+        # same as following:
+        # x = patches = torch.nn.functional.unfold(
+        #     x,
+        #     kernel_size=self.patch_size,
+        #     stride=self.patch_size,
+        # ).transpose(1, 2)
+
         # Linear projection per patch
         x = self.proj(x)  # (B, N, D)
         x = self.norm(x)
