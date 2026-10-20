@@ -1,4 +1,14 @@
-"""Compact BitNetCNN ternary layers with optional int8 reference inference."""
+"""Compact BitNetCNN ternary layers with adaptive scaling axis.
+
+By default, Linear/Conv2d/ConvTranspose2d choose output-channel (dim 0)
+versus input-channel (dim 1) ternary scaling by minimum weight MSE.
+The quantizer chooses each forward; freezing chooses on final trained weights.
+Force dim=0 or dim=1 in a layer constructor to lock the grouping.
+
+Frozen inference performs input or output scaling around one operator.
+For input-side scaling, forward_integer uses an FP32 reference with int8
+input/output: the pure-int32 requantization path requires output scales.
+"""
 
 import collections
 import math
@@ -106,18 +116,56 @@ def _reduce_abs(x: torch.Tensor, keep_dim: int, op: str = "mean"):
     return s.permute(*inv).contiguous().clamp_min(EPS)
 
 
-def _ternary_ste(weight: torch.Tensor, dim=0, scale_op="median"):
-    s = _reduce_abs(weight, keep_dim=dim, op=scale_op)
-    q = torch.round((weight / s).detach()).clamp(-1, 1)
-    return weight + (q * s - weight).detach()
+@torch.no_grad()
+def _choose_ternary_dim(weight: torch.Tensor, scale_op="median") -> int:
+    """Select output (0) or input (1) scaling by reconstructed-weight MSE.
+
+    For ConvTranspose2d, pass the canonical output-first weight layout.
+    Ties choose output scaling, which also has a pure int32 inference path.
+    """
+    if weight.ndim < 2:
+        raise ValueError("Expected weight with at least 2 dimensions")
+    w = weight.detach().float()
+    errors = []
+    for dim in (0, 1):
+        scale = _reduce_abs(w, keep_dim=dim, op=scale_op)
+        q = torch.round(w / scale).clamp(-1, 1)
+        errors.append((w - q * scale).square().mean())
+    return 0 if errors[0] <= errors[1] else 1
 
 
-def _freeze_ternary(weight: torch.Tensor, scale_op="median"):
-    """Quantize along output dim 0; return ternary q and flat per-output scale."""
-    scale = _reduce_abs(weight, keep_dim=0, op=scale_op).reshape(weight.shape[0])
-    shape = (weight.shape[0],) + (1,) * (weight.dim() - 1)
-    q = torch.round(weight / scale.view(shape)).clamp(-1, 1).to(weight.dtype)
+def _resolve_ternary_dim(weight: torch.Tensor, dim, scale_op="median") -> int:
+    if dim == "auto":
+        return _choose_ternary_dim(weight, scale_op)
+    if dim not in (0, 1):
+        raise ValueError("dim must be 0, 1, or 'auto'")
+    return int(dim)
+
+
+def _quantized_ternary(weight: torch.Tensor, dim: int, scale_op="median"):
+    """Return ternary codes and broadcastable FP32 scales."""
+    with torch.no_grad():
+        w = weight.detach().float()
+        scale = _reduce_abs(w, keep_dim=dim, op=scale_op)
+        q = torch.round(w / scale).clamp(-1, 1)
     return q, scale
+
+
+def _ternary_ste(weight: torch.Tensor, dim="auto", scale_op="median"):
+    chosen_dim = _resolve_ternary_dim(weight, dim, scale_op)
+    q, s = _quantized_ternary(weight, chosen_dim, scale_op)
+    quantized = (q * s).to(weight.dtype)
+    # Quantized forward, identity-gradient backward; the scale is not learned.
+    return weight + (quantized - weight).detach()
+
+
+@torch.no_grad()
+def _freeze_ternary(weight: torch.Tensor, scale_op="median", dim="auto", return_dim=False):
+    """Return (ternary codes, flat scales); optionally return chosen axis too."""
+    chosen_dim = _resolve_ternary_dim(weight, dim, scale_op)
+    q, scale = _quantized_ternary(weight, chosen_dim, scale_op)
+    result = q.to(weight.dtype), scale.flatten().to(weight.dtype)
+    return (*result, chosen_dim) if return_dim else result
 
 
 # -----------------------------------------------------------------------------
@@ -215,6 +263,14 @@ class _IntegerInferMixin:
         if sx.item() <= 0 or sy.item() <= 0:
             raise ValueError("input_scale and output_scale must be > 0")
 
+        # Input-channel scaling cannot use a single requantization factor per
+        # output channel. Its forward_integer() uses a float32 reference path
+        # (quantized input/output, ternary weights), not a pure int32 kernel.
+        if self.scale_dim == 1:
+            self.requant_M = self.requant_n = self.bias_int32 = None
+            self.input_scale, self.output_scale = float(sx.item()), float(sy.item())
+            return self
+
         sw = self.scale.detach().reshape(-1).to(torch.float64)
         if sw.numel() != self._out_count:
             raise ValueError(f"expected {self._out_count} weight scales, got {sw.numel()}")
@@ -235,8 +291,21 @@ class _IntegerInferMixin:
     def _check_integer_input(self, x):
         if x.dtype != torch.int8:
             raise TypeError(f"forward_integer expects torch.int8 input, got {x.dtype}")
-        if self.requant_M is None or self.requant_n is None:
+        if self.input_scale is None or self.output_scale is None:
             raise RuntimeError("integer metadata is not prepared; call prepare_integer(input_scale, output_scale) first")
+        if self.scale_dim == 0 and (self.requant_M is None or self.requant_n is None):
+            raise RuntimeError("missing output-channel integer requantization metadata")
+
+    def _finish_input_scaled_reference(self, x, forward_fn):
+        """Int8 I/O reference for input-channel scaling (FP32 accumulation).
+
+        Exact input-channel scales cannot be factored into the existing
+        output-channel-only int32 requantizer. This is a correct *reference*
+        implementation, not a pure-integer fast kernel.
+        """
+        self._check_integer_input(x)
+        y = forward_fn(x.float() * self.input_scale)
+        return torch.round(y / self.output_scale).clamp(-128, 127).to(torch.int8)
 
     def _finish_integer(self, acc, x, channel_shape):
         if acc.dtype != torch.int32:
@@ -266,7 +335,7 @@ class Bit:
 
         @staticmethod
         def conv2d(input, weight, bias=None, stride=1, padding=0, padding_mode="zeros",
-                   dilation=1, groups=1, dim=0, scale_op="median"):
+                   dilation=1, groups=1, dim="auto", scale_op="median"):
             weight = _ternary_ste(weight, dim, scale_op)
             if padding_mode != "zeros" and padding != 0:
                 if isinstance(padding, int):
@@ -280,7 +349,7 @@ class Bit:
             return F.conv2d(input, weight, bias, stride, padding, dilation, groups)
 
         @staticmethod
-        def linear(input, weight, bias=None, dim=0, scale_op="median"):
+        def linear(input, weight, bias=None, dim="auto", scale_op="median"):
             return F.linear(input, _ternary_ste(weight, dim, scale_op), bias)
 
     class CommonConv2d(nn.Module):
@@ -312,9 +381,15 @@ class Bit:
             if weight is None:
                 weight, scale = self.get_weights(x.dtype, x.device)
             x, padding = self._pad(x)
+            if scale is not None and self.scale_dim == 1:
+                # weight axis 1 = local input channel within each convolution group
+                input_scale = scale.flatten().repeat(self.groups)
+                x = x * input_scale.view(1, -1, 1, 1)
+                scale = None
+                return self._op(x, weight, self.bias, padding)
             y = self._op(x, weight, self.bias if scale is None else None, padding)
             if scale is not None:
-                y = y * scale
+                y = y * scale.view(1, -1, 1, 1)
                 if self.bias is not None:
                     y = y + self.bias.view(1, -1, 1, 1)
             return y
@@ -330,7 +405,7 @@ class Bit:
             )
 
     class Bit1p58Weight(nn.Module):
-        def __init__(self, dim=0, scale_op="median"):
+        def __init__(self, dim="auto", scale_op="median"):
             super().__init__()
             self.dim, self.scale_op = dim, scale_op
 
@@ -339,40 +414,49 @@ class Bit:
 
     class Conv2d(CommonConv2d):
         def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0,
-                     padding_mode="zeros", dilation=1, groups=1, bias=True, scale_op="median"):
+                     padding_mode="zeros", dilation=1, groups=1, bias=True, scale_op="median", dim="auto"):
             super().__init__(in_channels, out_channels, kernel_size, stride, padding,
                              padding_mode, dilation, groups, bias, scale_op)
             kh, kw = self.kernel_size
             self.weight = nn.Parameter(torch.empty(out_channels, in_channels // groups, kh, kw))
             nn.init.kaiming_normal_(self.weight, nonlinearity="relu")
             self.bias = nn.Parameter(torch.zeros(out_channels)) if bias else None
-            self.w_q = Bit.Bit1p58Weight(0, scale_op)
+            self.w_q = Bit.Bit1p58Weight(dim, scale_op)
 
         def get_weights(self, dtype, device):
             return self.w_q(self.weight).to(dtype=dtype, device=device), None
 
         @torch.no_grad()
         def to_ternary(self, dtype=torch.int8):
-            q, s = _freeze_ternary(self.weight.data, self.scale_op)
+            q, s, dim = _freeze_ternary(self.weight.data, self.scale_op, self.w_q.dim, return_dim=True)
             return Bit.Conv2dInfer(
-                q.to(torch.int8) if dtype else q, s.view(-1, 1, 1),
+                q.to(torch.int8) if dtype else q, s,
                 None if self.bias is None else self.bias.data.clone(),
                 self.in_channels, self.out_channels, self.kernel_size,
                 self.stride, self.padding, self.padding_mode, self.dilation, self.groups, self.scale_op,
+                dim=dim,
             ).to(self.weight.device)
 
     class Conv2dInfer(_IntegerInferMixin, CommonConv2d):
         def __init__(self, weight, scale, bias, in_channels, out_channels, kernel_size,
-                     stride=1, padding=0, padding_mode="zeros", dilation=1, groups=1, scale_op="median"):
+                     stride=1, padding=0, padding_mode="zeros", dilation=1, groups=1,
+                     scale_op="median", dim=0):
             super().__init__(in_channels, out_channels, kernel_size, stride, padding,
                              padding_mode, dilation, groups, bias is not None, scale_op)
+            self.register_buffer("quant_dim", torch.tensor(dim, dtype=torch.int8))
             self._init_frozen(weight, scale, bias)
+
+        @property
+        def scale_dim(self):
+            return int(self.quant_dim.item())
 
         def get_weights(self, dtype, device):
             return self.weight.to(device=device, dtype=dtype), self.scale.to(device=device)
 
         def forward_integer(self, x):
             self._check_integer_input(x)
+            if self.scale_dim == 1:
+                return self._finish_input_scaled_reference(x, self.forward)
             x, padding = self._pad(x)
             acc = _conv2d_int32_reference(
                 x.int(), self.weight.to(device=x.device, dtype=torch.int32),
@@ -385,10 +469,11 @@ class Bit:
     class ConvTranspose2d(CommonConvTranspose2d):
         def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0,
                      output_padding=0, padding_mode="zeros", dilation=1, groups=1,
-                     bias=True, scale_op="median"):
+                     bias=True, scale_op="median", dim="auto"):
             super().__init__(in_channels, out_channels, kernel_size, stride, padding,
                              padding_mode, dilation, groups, bias, scale_op,
                              output_padding=output_padding)
+            self.dim = dim
             kh, kw = self.kernel_size
             self.weight = nn.Parameter(torch.empty(in_channels, out_channels // groups, kh, kw))
             nn.init.kaiming_normal_(self.weight, nonlinearity="relu")
@@ -406,34 +491,41 @@ class Bit:
 
         def get_weights(self, dtype, device):
             w = self._weight_to_out(self.weight)
-            return self._weight_from_out(_ternary_ste(w, 0, self.scale_op)).to(dtype=dtype, device=device), None
+            return self._weight_from_out(_ternary_ste(w, self.dim, self.scale_op)).to(dtype=dtype, device=device), None
 
         @torch.no_grad()
         def to_ternary(self, dtype=torch.int8):
-            q, s = _freeze_ternary(self._weight_to_out(self.weight.data), self.scale_op)
+            q, s, dim = _freeze_ternary(self._weight_to_out(self.weight.data), self.scale_op, self.dim, return_dim=True)
             q = self._weight_from_out(q)
             return Bit.ConvTranspose2dInfer(
-                q.to(torch.int8) if dtype else q, s.view(-1, 1, 1),
+                q.to(torch.int8) if dtype else q, s,
                 None if self.bias is None else self.bias.data.clone(),
                 self.in_channels, self.out_channels, self.kernel_size,
                 self.stride, self.padding, self.output_padding, self.padding_mode,
-                self.dilation, self.groups, self.scale_op,
+                self.dilation, self.groups, self.scale_op, dim=dim,
             ).to(self.weight.device)
 
     class ConvTranspose2dInfer(_IntegerInferMixin, CommonConvTranspose2d):
         def __init__(self, weight, scale, bias, in_channels, out_channels, kernel_size,
                      stride=1, padding=0, output_padding=0, padding_mode="zeros",
-                     dilation=1, groups=1, scale_op="median"):
+                     dilation=1, groups=1, scale_op="median", dim=0):
             super().__init__(in_channels, out_channels, kernel_size, stride, padding,
                              padding_mode, dilation, groups, bias is not None, scale_op,
                              output_padding=output_padding)
+            self.register_buffer("quant_dim", torch.tensor(dim, dtype=torch.int8))
             self._init_frozen(weight, scale, bias)
+
+        @property
+        def scale_dim(self):
+            return int(self.quant_dim.item())
 
         def get_weights(self, dtype, device):
             return self.weight.to(device=device, dtype=dtype), self.scale.to(device=device)
 
         def forward_integer(self, x):
             self._check_integer_input(x)
+            if self.scale_dim == 1:
+                return self._finish_input_scaled_reference(x, self.forward)
             x, padding = self._pad(x)
             acc = _conv_transpose2d_int32_reference(
                 x.int(), self.weight.to(device=x.device, dtype=torch.int32),
@@ -444,38 +536,49 @@ class Bit:
         forward_int8 = forward_integer
 
     class Linear(nn.Module):
-        def __init__(self, in_f, out_f, bias=True, scale_op="median"):
+        def __init__(self, in_f, out_f, bias=True, scale_op="median", dim="auto"):
             super().__init__()
             self.in_features, self.out_features, self.scale_op = in_f, out_f, scale_op
             self.weight = nn.Parameter(torch.empty(out_f, in_f))
             nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
             self.bias = nn.Parameter(torch.zeros(out_f)) if bias else None
-            self.w_q = Bit.Bit1p58Weight(0, scale_op)
+            self.w_q = Bit.Bit1p58Weight(dim, scale_op)
 
         def forward(self, x):
             return F.linear(x, self.w_q(self.weight), self.bias)
 
         @torch.no_grad()
         def to_ternary(self, dtype=torch.int8):
-            q, s = _freeze_ternary(self.weight.data, self.scale_op)
+            q, s, dim = _freeze_ternary(self.weight.data, self.scale_op, self.w_q.dim, return_dim=True)
             return Bit.LinearInfer(
                 self.in_features, self.out_features,
                 q.to(torch.int8) if dtype else q, s,
-                None if self.bias is None else self.bias.data.clone(),
+                None if self.bias is None else self.bias.data.clone(), dim=dim,
             ).to(self.weight.device)
 
     class LinearInfer(_IntegerInferMixin, nn.Module):
-        def __init__(self, in_f, out_f, weight, scale, bias):
+        def __init__(self, in_f, out_f, weight, scale, bias, dim=0):
             super().__init__()
             self.in_features, self.out_features = in_f, out_f
+            self.register_buffer("quant_dim", torch.tensor(dim, dtype=torch.int8))
             self._init_frozen(weight, scale, bias)
 
+        @property
+        def scale_dim(self):
+            return int(self.quant_dim.item())
+
         def forward(self, x):
-            y = F.linear(x, self.weight.to(device=x.device, dtype=x.dtype)) * self.scale.to(x.device)
-            return y if self.bias is None else y + self.bias.to(x.device)
+            q = self.weight.to(device=x.device, dtype=x.dtype)
+            s = self.scale.to(device=x.device, dtype=x.dtype)
+            bias = None if self.bias is None else self.bias.to(device=x.device, dtype=x.dtype)
+            if self.scale_dim == 1:
+                return F.linear(x * s, q, bias)
+            return F.linear(x, q) * s + (0 if bias is None else bias)
 
         def forward_integer(self, x):
             self._check_integer_input(x)
+            if self.scale_dim == 1:
+                return self._finish_input_scaled_reference(x, self.forward)
             acc = F.linear(x.int(), self.weight.to(device=x.device, dtype=torch.int32))
             shape = (1,) * (acc.dim() - 1) + (-1,)
             return self._finish_integer(acc, x, shape)
