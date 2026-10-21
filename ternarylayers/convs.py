@@ -76,6 +76,8 @@ class Conv2dModels:
         
         bit: bool = True
         scale_op: str = "median"
+
+        dim: Union[str,int] = "auto" # qunt_dim
         
         @classmethod
         def specifics(cls):
@@ -392,6 +394,8 @@ class Conv2dModels:
         )
         shortcut_layer: Union['Conv2dModels.Conv2dNorm',NormModels.Identity] = Field(default_factory=NormModels.Identity)
 
+        conv_qunt_dim: Union[str,int] = "auto"
+
         @model_validator(mode='after')
         def valid_model(self):
             self.padding = convert_padding(self.padding)
@@ -418,6 +422,7 @@ class Conv2dModels:
                 self.shortcut_layer = Conv2dModels.Conv2dNorm(
                     in_channels=-1,
                     norm=NormModels.BatchNorm2d(num_features=-1),
+                    dim=self.conv_qunt_dim,
                 )
                 self.shortcut_layer.in_channels = self.in_channels
                 self.shortcut_layer.out_channels = self.out_channels
@@ -463,6 +468,8 @@ class Conv2dModels:
         )
         shortcut_layer: Union['Conv2dModels.Conv2dNorm',NormModels.Identity] = Field(default_factory=NormModels.Identity)
 
+        conv_qunt_dim: Union[str,int] = "auto"
+
         @model_validator(mode='after')
         def valid_model(self):
             self.padding = convert_padding(self.padding)
@@ -500,6 +507,7 @@ class Conv2dModels:
                 self.shortcut_layer = Conv2dModels.Conv2dNorm(
                     in_channels=-1,
                     norm=NormModels.BatchNorm2d(num_features=-1),
+                    dim=self.conv_qunt_dim,
                 )
                 self.shortcut_layer.in_channels = self.in_channels
                 self.shortcut_layer.out_channels = self.out_channels

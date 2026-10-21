@@ -30,6 +30,9 @@ class ResNetModels:
         stem_pool:Union[PoolModels.MaxPool2d, NormModels.Identity]=None
         head_pool:PoolModels.AdaptiveAvgPool2d=None
         head:LinearModels.Linear=None
+
+        conv_qunt_dim: Union[str,int] = "auto"
+        linear_qunt_dim: Union[str,int] = "auto"
         
         def get_block(self,in_channels,out_channels,stride):
             return Conv2dModels.ResNetBottleneck(
@@ -43,17 +46,20 @@ class ResNetModels:
                                             norm=self.norm.model_copy(),
                                             act=self.act.model_copy(),
                                             scale_op=self.scale_op,
+                                            dim=self.conv_qunt_dim,
                                         ),
                     conv_transform_layer=Conv2dModels.Conv2dNormAct(
                                             in_channels=-1,
                                             norm=self.norm.model_copy(),
                                             act=self.act.model_copy(),
                                             scale_op=self.scale_op,
+                                            dim=self.conv_qunt_dim,
                                         ),
                     conv_expand_layer=Conv2dModels.Conv2dNorm(
                                             in_channels=-1,
                                             norm=self.norm.model_copy(),
                                             scale_op=self.scale_op,
+                                            dim=self.conv_qunt_dim,
                                         ),
                     scale_op=self.scale_op,
                     bit=True,
@@ -73,6 +79,7 @@ class ResNetModels:
                     bias=False,
                     norm=self.norm.model_copy(),
                     act=self.act.model_copy(),
+                    dim=self.conv_qunt_dim,
                 )
                 self.stem_pool = NormModels.Identity()
             else:
@@ -85,6 +92,7 @@ class ResNetModels:
                         bias=False,
                         norm=self.norm.model_copy(),
                         act=self.act.model_copy(),
+                        dim=self.conv_qunt_dim,
                     )
                 self.stem_pool = PoolModels.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
@@ -102,7 +110,8 @@ class ResNetModels:
             self.head_pool = PoolModels.AdaptiveAvgPool2d(output_size=1)
             self.head = LinearModels.Linear(in_features=in_channels[-1] * self.expansion,
                                             out_features=self.num_classes,
-                                            bias=True, scale_op=self.scale_op)
+                                            bias=True, scale_op=self.scale_op,
+                                            dim=self.linear_qunt_dim)
 
             return super().model_post_init(context)
 
@@ -127,14 +136,17 @@ class ResNetModels:
                                             norm=self.norm.model_copy(),
                                             act=self.act.model_copy(),
                                             scale_op=self.scale_op,
+                                            dim=self.conv_qunt_dim,
                                         ),
                             conv2_layer=Conv2dModels.Conv2dNorm(
                                             in_channels=-1,
                                             norm=self.norm.model_copy(),
                                             scale_op=self.scale_op,
+                                            dim=self.conv_qunt_dim,
                                         ),
                             scale_op=self.scale_op,
                             bit=True,
+                            conv_qunt_dim=self.conv_qunt_dim,
                         )
 
     class R50(BasicModel):

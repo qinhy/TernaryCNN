@@ -521,6 +521,7 @@ class DinoVisionTransformerTRM(DinoVisionTransformer):
         )
 
 def vit_femto(patch_size=16, cls=DinoVisionTransformer, **kwargs):
+    # 0.149888M params
     # ultra tiny, minimal capacity
     model = cls(
         patch_size=patch_size,
@@ -533,6 +534,7 @@ def vit_femto(patch_size=16, cls=DinoVisionTransformer, **kwargs):
     return model
 
 def vit_pico(patch_size=16, cls=DinoVisionTransformer, **kwargs):
+    # 0.373344M params
     # smaller than micro, good for very fast experiments
     model = cls(
         patch_size=patch_size,
@@ -545,6 +547,7 @@ def vit_pico(patch_size=16, cls=DinoVisionTransformer, **kwargs):
     return model
 
 def vit_micro(patch_size=8, cls=DinoVisionTransformer, **kwargs):
+    # 0.555136M params
     # very small + very fast
     model = cls(
         patch_size=patch_size,
@@ -557,6 +560,7 @@ def vit_micro(patch_size=8, cls=DinoVisionTransformer, **kwargs):
     return model
 
 def vit_nano(patch_size=8, cls=DinoVisionTransformer, **kwargs):
+    # 1.819968M params
     # small, still fast, a bit more capacity
     model = cls(
         patch_size=patch_size,
@@ -569,6 +573,7 @@ def vit_nano(patch_size=8, cls=DinoVisionTransformer, **kwargs):
     return model
 
 def vit_tiny(patch_size=8, cls=DinoVisionTransformer, **kwargs):
+    # 4.788992M params
     # common "tiny-ish" setting for quick experiments
     model = cls(
         patch_size=patch_size,
@@ -581,6 +586,7 @@ def vit_tiny(patch_size=8, cls=DinoVisionTransformer, **kwargs):
     return model
 
 def vit_small(patch_size=16,  cls=DinoVisionTransformer, **kwargs):
+    # 21.5904M params
     model = cls(
         patch_size=patch_size,
         embed_dim=384,
@@ -593,6 +599,7 @@ def vit_small(patch_size=16,  cls=DinoVisionTransformer, **kwargs):
 
 
 def vit_base(patch_size=16,  cls=DinoVisionTransformer, **kwargs):
+    # 85.648128M params
     model = cls(
         patch_size=patch_size,
         embed_dim=768,
@@ -605,6 +612,7 @@ def vit_base(patch_size=16,  cls=DinoVisionTransformer, **kwargs):
 
 
 def vit_large(patch_size=16,  cls=DinoVisionTransformer, **kwargs):
+    # 303.100928M params
     model = cls(
         patch_size=patch_size,
         embed_dim=1024,
@@ -629,6 +637,7 @@ def vit_so400m(patch_size=16,  cls=DinoVisionTransformer, **kwargs):
 
 
 def vit_huge2(patch_size=16,  cls=DinoVisionTransformer, **kwargs):
+    # 630.66752M params
     model = cls(
         patch_size=patch_size,
         embed_dim=1280,
@@ -641,6 +650,7 @@ def vit_huge2(patch_size=16,  cls=DinoVisionTransformer, **kwargs):
 
 
 def vit_giant2(patch_size=16,  cls=DinoVisionTransformer, **kwargs):
+    # 1134.448128M params
     """
     Close to ViT-giant, with embed-dim 1536 and 24 heads => embed-dim per head 64
     """

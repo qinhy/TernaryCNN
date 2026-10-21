@@ -24,6 +24,8 @@ class LinearModels:
 
         bit: bool = True
         scale_op: str = "median"
+        
+        dim: Union[str,int] = "auto" # qunt_dim
 
     class LinearBn(Linear):
         norm: NormModels.type
