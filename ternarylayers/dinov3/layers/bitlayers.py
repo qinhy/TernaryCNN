@@ -18,10 +18,11 @@ class Linear(Bit.Linear):
         *,
         bit: bool = True,
         scale_op: str = "median",
+        dim="auto",
     ) -> None:
         if not bit:
             raise ValueError("The DINOv3 BitLinear adapter only supports bit=True")
-        super().__init__(in_features, out_features, bias=bias, scale_op=scale_op)
+        super().__init__(in_features, out_features, bias=bias, scale_op=scale_op, dim=dim)
         if device is not None or dtype is not None:
             self.to(device=device, dtype=dtype)
 

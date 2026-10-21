@@ -39,6 +39,7 @@ class PatchEmbed(nn.Module):
         embed_dim: int = 768,
         norm_layer: Callable | None = None,
         flatten_embedding: bool = True,
+        quant_dim=0,
     ) -> None:
         super().__init__()
 
@@ -59,7 +60,7 @@ class PatchEmbed(nn.Module):
 
         self.flatten_embedding = flatten_embedding
 
-        self.proj = BitConv2d(in_chans, embed_dim, kernel_size=patch_HW, stride=patch_HW)
+        self.proj = BitConv2d(in_chans, embed_dim, kernel_size=patch_HW, stride=patch_HW, dim=quant_dim)
         self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
 
     def forward(self, x: Tensor) -> Tensor:
@@ -103,6 +104,7 @@ class PatchEmbedNoConv(nn.Module):
         norm_layer: Callable | None = None,
         flatten_embedding: bool = True,
         bias=True,
+        quant_dim=1,
     ) -> None:
         super().__init__()
 
@@ -125,7 +127,7 @@ class PatchEmbedNoConv(nn.Module):
         patch_dim = in_chans * patch_HW[0] * patch_HW[1]
 
         # If you have a quantized/bit linear layer, replace nn.Linear with BitLinear
-        self.proj = Linear(patch_dim, embed_dim, bias=bias)
+        self.proj = Linear(patch_dim, embed_dim, bias=bias, dim=quant_dim)
         self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
 
     def forward(self, x: Tensor) -> Tensor:

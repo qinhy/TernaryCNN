@@ -91,6 +91,10 @@ class DinoVisionTransformer(nn.Module):
         untie_global_and_local_cls_norm: bool = False,
         device: Any | None = None,
         no_conv: bool = False,
+        
+        sattn_qkv_quant_dim: int | List[int]=0,
+        sattn_fc1_quant_dim: int | List[int]=0,
+        sattn_fc2_quant_dim: int | List[int]=1,
         **ignored_kwargs,
     ):
         super().__init__()
@@ -185,6 +189,10 @@ class DinoVisionTransformer(nn.Module):
                 init_values=layerscale_init,
                 mask_k_bias=mask_k_bias,
                 device=device,
+
+                qkv_quant_dim=sattn_qkv_quant_dim,
+                fc1_quant_dim=sattn_fc1_quant_dim if isinstance(sattn_fc1_quant_dim,int) else sattn_fc1_quant_dim[i],
+                fc2_quant_dim=sattn_fc2_quant_dim if isinstance(sattn_fc2_quant_dim,int) else sattn_fc2_quant_dim[i],
             )
             for i in range(depth)
         ]

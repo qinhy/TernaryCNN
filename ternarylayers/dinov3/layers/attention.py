@@ -55,6 +55,7 @@ class SelfAttention(nn.Module):
         proj_drop: float = 0.0,
         mask_k_bias: bool = False,
         device=None,
+        qkv_quant_dim=0,
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
@@ -62,7 +63,7 @@ class SelfAttention(nn.Module):
         self.scale = head_dim**-0.5
 
         linear_class = LinearKMaskedBias if mask_k_bias else BitLinear
-        self.qkv = linear_class(dim, dim * 3, bias=qkv_bias).to(device=device)
+        self.qkv = linear_class(dim, dim * 3, bias=qkv_bias, dim=qkv_quant_dim).to(device=device)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = BitLinear(dim, dim, bias=proj_bias).to(device=device)
         self.proj_drop = nn.Dropout(proj_drop)

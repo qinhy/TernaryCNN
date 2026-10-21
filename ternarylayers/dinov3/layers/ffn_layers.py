@@ -32,13 +32,15 @@ class Mlp(nn.Module, ListForwardMixin):
         drop: float = 0.0,
         bias: bool = True,
         device=None,
+        fc1_quant_dim=0,
+        fc2_quant_dim=1,
     ) -> None:
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
-        self.fc1 = BitLinear(in_features, hidden_features, bias=bias).to(device=device)
+        self.fc1 = BitLinear(in_features, hidden_features, bias=bias, dim=fc1_quant_dim).to(device=device)
         self.act = act_layer()
-        self.fc2 = BitLinear(hidden_features, out_features, bias=bias).to(device=device)
+        self.fc2 = BitLinear(hidden_features, out_features, bias=bias, dim=fc2_quant_dim).to(device=device)
         self.drop = nn.Dropout(drop)
 
     def forward(self, x: Tensor) -> Tensor:
