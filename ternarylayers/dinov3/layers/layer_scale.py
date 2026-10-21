@@ -27,3 +27,20 @@ class LayerScale(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return x.mul_(self.gamma) if self.inplace else x * self.gamma
+
+
+class MatryoshkaLayerScale(LayerScale):
+    """LayerScale with nested channel widths."""
+
+    def forward(self, x: Tensor) -> Tensor:
+        width = x.shape[-1]
+
+        if not 1 <= width <= self.gamma.numel():
+            raise ValueError(f"Invalid width: {width}")
+
+        if width == self.gamma.numel():
+            return super().forward(x)
+
+        gamma = self.gamma[:width]
+
+        return x.mul_(gamma) if self.inplace else x * gamma

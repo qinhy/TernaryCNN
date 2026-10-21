@@ -78,3 +78,49 @@ class SwiGLUFFN(nn.Module, ListForwardMixin):
         x2 = self.w2(x)
         hidden = F.silu(x1) * x2
         return self.w3(hidden)
+
+
+class MatryoshkaMlp(Mlp):
+    """MLP with shared weights and an input-dependent active width.
+
+    The input's last dimension selects the active residual width. Both the
+    expansion layer and the contraction layer use weight prefixes. Quantization
+    happens *after* slicing, using each BitLinear's own w_q quantizer.
+
+    Example with a full 1024 -> 4096 -> 1024 MLP:
+        x.shape[-1] == 256  ->  256 -> 1024 -> 256
+    """
+
+    @staticmethod
+    def _linear_prefix(layer, x: Tensor, out_features: int) -> Tensor:
+        """Evaluate only the requested top-left submatrix of a BitLinear."""
+        if x.shape[-1] == layer.in_features and out_features == layer.out_features:
+            return layer(x)  # Identical to the original BitLinear call.
+
+        weight = layer.weight[:out_features, : x.shape[-1]]
+        bias = layer.bias[:out_features] if layer.bias is not None else None
+        return F.linear(x, layer.w_q(weight), bias)
+
+    def forward(self, x: Tensor) -> Tensor:
+        width = x.shape[-1]
+        full_width = self.fc1.in_features
+        if not 1 <= width <= full_width:
+            raise ValueError(f"Input width must be in [1, {full_width}], got {width}")
+
+        if width == full_width:
+            return super().forward(x)  # Keep full-width Mlp behavior unchanged.
+
+        # Preserve the original FFN expansion/output ratios.
+        hidden = max(1, self.fc1.out_features * width // full_width)
+        out_width = max(1, self.fc2.out_features * width // full_width)
+
+        x = self._linear_prefix(self.fc1, x, hidden)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self._linear_prefix(self.fc2, x, out_width)
+        x = self.drop(x)
+        return x
+
+    def forward_list(self, x_list: list[Tensor]) -> list[Tensor]:
+        """Handle multiple images/crops, including different active widths."""
+        return [self.forward(x) for x in x_list]
