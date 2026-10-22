@@ -1,13 +1,11 @@
-"""Sandwich-train one ternary Matryoshka ViT-Micro on MNIST.
-
-Install vision_transformer_matryoshka.py in the same models package as
-vision_transformer.py, plus matryoshka_block.py in the layers package.
+"""Sandwich-train a configurable ternary Matryoshka ViT on MNIST.
 
 Example:
     python train_mnist_matryoshka.py --epochs 20 --device auto
 
-Saves one shared student plus compact *learned-weight* exports for Micro,
-Pico and Femto. Exported weights have NOT been frozen into ternary integers;
+Use --arch small, base or large to select the shared network.
+Saves one shared student plus compact *learned-weight* exports for its splits.
+Exported weights have NOT been frozen into ternary integers;
 perform backend-specific quantization/export AFTER extraction.
 """
 from __future__ import annotations
@@ -22,7 +20,8 @@ from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
 from ternarylayers.dinov3.models.vision_transformer_matryoshka import (
-    MatryoshkaMNISTClassifier, SPLITS, vit_matryoshka_micro,
+    MatryoshkaClassifier, vit_matryoshka_small,
+    vit_matryoshka_base, vit_matryoshka_large,
 )
 
 
@@ -30,6 +29,7 @@ def args_parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--data-dir', type=Path, default=Path('data/mnist'))
     p.add_argument('--save-dir', type=Path, default=Path('checkpoints/mnist-matryoshka'))
+    p.add_argument('--arch', choices=('small', 'base', 'large'), default='small')
     p.add_argument('--epochs', type=int, default=20)
     p.add_argument('--batch-size', type=int, default=128)
     p.add_argument('--learning-rate', type=float, default=3e-4)
@@ -72,8 +72,8 @@ def run_epoch(model, loader, device, optimizer=None):
     training = optimizer is not None
     model.train(training)
     count = 0
-    total_loss = {name: 0.0 for name in SPLITS}
-    correct = {name: 0 for name in SPLITS}
+    total_loss = {name: 0.0 for name in model.splits}
+    correct = {name: 0 for name in model.splits}
     context = torch.enable_grad() if training else torch.no_grad()
     with context:
         for images, labels in loader:
@@ -83,7 +83,7 @@ def run_epoch(model, loader, device, optimizer=None):
             losses = []
             # The sandwich rule uses max, min and intermediate widths at
             # each update. Every branch accumulates shared-parameter grads.
-            for name in ('micro', 'femto', 'pico'):
+            for name in model.splits:
                 logits = model(images, name=name)
                 loss = F.cross_entropy(logits, labels)
                 losses.append(loss)
@@ -94,7 +94,7 @@ def run_epoch(model, loader, device, optimizer=None):
                 optimizer.step()
             count += labels.size(0)
     return {name: {'loss': total_loss[name]/count, 'accuracy': correct[name]/count}
-            for name in SPLITS}
+            for name in model.splits}
 
 
 def main():
@@ -110,13 +110,16 @@ def main():
     test_loader = DataLoader(dataset(args.data_dir, False, args.limit_test),
                              shuffle=False, **loader_args)
 
-    backbone = vit_matryoshka_micro(img_size=32, patch_size=8, no_conv=True)
+    factories = dict(small=vit_matryoshka_small,
+                     base=vit_matryoshka_base, large=vit_matryoshka_large)
+    backbone = factories[args.arch](img_size=32, patch_size=8, no_conv=True)
+    largest_name = max(backbone.splits, key=lambda name: backbone.splits[name])
     backbone.init_weights()   # parent DINOv3 explicitly exposes init_weights()
-    model = MatryoshkaMNISTClassifier(backbone=backbone).to(device)
+    model = MatryoshkaClassifier(backbone=backbone).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate,
                                   weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    start_epoch, best_micro = 0, -1.0
+    start_epoch, best_accuracy = 0, -1.0
     best_path = args.save_dir/'best_shared.pt'
     if args.resume:
         payload = torch.load(args.resume, map_location=device, weights_only=True)
@@ -124,14 +127,14 @@ def main():
         optimizer.load_state_dict(payload['optimizer_state_dict'])
         scheduler.load_state_dict(payload['scheduler_state_dict'])
         start_epoch = int(payload['epoch'])
-        best_micro = float(payload.get('best_micro_accuracy', -1.0))
+        best_accuracy = float(payload.get('best_accuracy', -1.0))
 
     for epoch in range(start_epoch + 1, args.epochs+1):
         train_metrics = run_epoch(model, train_loader, device, optimizer)
         val_metrics = run_epoch(model, test_loader, device)
         scheduler.step()
         print(f'Epoch {epoch}/{args.epochs}')
-        for name in SPLITS:
+        for name in model.splits:
             t, v = train_metrics[name], val_metrics[name]
             print(f'  {name:5s}: train_acc={t["accuracy"]:.4f} val_acc={v["accuracy"]:.4f} '
                   f'val_loss={v["loss"]:.4f}')
@@ -139,27 +142,29 @@ def main():
                   'optimizer_state_dict': optimizer.state_dict(),
                   'scheduler_state_dict': scheduler.state_dict(),
                   'epoch': epoch,
-                  'best_micro_accuracy': max(best_micro, val_metrics['micro']['accuracy']),
+                  'best_accuracy': max(best_accuracy, val_metrics[largest_name]['accuracy']),
+                  'arch': args.arch,
+                  'splits': backbone.splits,
                   'metrics': val_metrics}
         torch.save(shared, args.save_dir/'last_shared.pt')
-        if val_metrics['micro']['accuracy'] >= best_micro:
-            best_micro = val_metrics['micro']['accuracy']
+        if val_metrics[largest_name]['accuracy'] >= best_accuracy:
+            best_accuracy = val_metrics[largest_name]['accuracy']
             torch.save(shared, best_path)
 
     if best_path.exists():
         saved = torch.load(best_path, map_location=device, weights_only=True)
         model.load_state_dict(saved['state_dict'], strict=True)
     model.eval()
-    for name, (width, depth) in SPLITS.items():
+    for name, (width, depth) in backbone.splits.items():
         compact = model.export_subnetwork(name).eval()
         torch.save({
             'state_dict': compact.state_dict(),
             'config': {'name': name, 'img_size': 32, 'patch_size': 8,
                        'in_chans': 3, 'no_conv': True, 'embed_dim': width,
-                       'num_heads': width//32, 'depth': depth,
-                       'ffn_ratio': 2.0, 'num_classes': 10},
+                       'num_heads': width//backbone.head_dim, 'depth': depth,
+                       'ffn_ratio': compact.backbone.ffn_ratio, 'num_classes': 10},
         }, args.save_dir/f'{name}_extracted.pt')
-        print(f'Extracted {name}: width={width} depth={depth} heads={width//32}')
+        print(f'Extracted {name}: width={width} depth={depth} heads={width//backbone.head_dim}')
 
 
 if __name__ == '__main__':

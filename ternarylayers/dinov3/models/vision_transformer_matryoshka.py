@@ -1,12 +1,13 @@
-# Matryoshka-BitViT: shared ternary ViT-Micro -> Pico -> Femto.
+# Matryoshka-BitViT: shared ternary ViTs with configurable width/depth prefixes.
 # Install alongside vision_transformer.py in ternarylayers/dinov3/models/.
 # This is an extension of the user-provided DINOv3-derived source; observe
 # its existing DINOv3 license terms.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from functools import partial
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Dict, List, Mapping, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -15,54 +16,68 @@ from torch import Tensor, nn
 from ternarylayers.dinov3.layers.rms_norm import MatryoshkaRMSNorm
 
 from .vision_transformer import DinoVisionTransformer
+from ternarylayers.dinov3.layers.ffn_layers import Mlp
 from ternarylayers.dinov3.layers.block import (
     MatryoshkaLayerNorm,
     SelfMatryoshkaAttentionBlock,
 )
 
 
-# One head dimension is necessary for prefix-compatible QKV and RoPE.
-# These are *elastic equivalents*, not identical attention configurations to
-# the original presets (Micro 2x64 and Femto 1x64).
-SPLITS = {
-    "micro": (128, 4),
-    "pico": (96, 4),
-    "femto": (64, 3),
-}
-HEAD_DIM = 32
+class DinoVisionMatryoshka(DinoVisionTransformer):
+    """A configurable shared ViT with width/depth prefix subnetworks.
 
-
-class DinoVisionMatryoshkaMicro(DinoVisionTransformer):
-    """Train once at width 128; run/export Micro, Pico and Femto prefixes.
-
-    Width/depth are per-forward selections; parameters remain shared.
-    A recognised no-conv linear patch projector is width-sliced before
-    quantization. Other patch embeddings fall back to full projection; the
-    exported standalone submodel always has a smaller patch projection.
-    The base DINOv3 forward_features dict keys are preserved.
+    ``embed_dim``, ``depth``, ``num_heads`` and ``ffn_ratio`` describe the largest
+    network. ``splits`` maps names to (width, depth) pairs for training/export.
+    Any width divisible by the fixed head dimension can run, even if unnamed.
+    Omitted width/depth select the full network (or a named width's depth).
+    Call ``init_weights()`` before training, as for DinoVisionTransformer.
+    Currently supports MLP FFNs and LayerNorm/RMSNorm only.
     """
 
-    def __init__(self, *, patch_size: int = 8, **kwargs):
-        for reserved in ("embed_dim", "depth", "num_heads", "ffn_ratio"):
-            if reserved in kwargs:
-                raise TypeError(f"{reserved} is fixed for Matryoshka Micro; use the preset")
-        super().__init__(
-            patch_size=patch_size,
-            embed_dim=128,
-            depth=4,
-            num_heads=4,
-            ffn_ratio=2.0,
-            **kwargs,
-        )
-        if self.ffn_layer != "mlp":
+    def __init__(
+        self, *, patch_size: int = 16, embed_dim: int = 768, depth: int = 12,
+        num_heads: int = 12, ffn_ratio: float = 4.0,
+        splits: Optional[Mapping[str, tuple[int, int]]] = None, **kwargs,
+    ):
+        for name, value in (("embed_dim", embed_dim), ("depth", depth), ("num_heads", num_heads)):
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if embed_dim % num_heads or (embed_dim // num_heads) % 4:
+            raise ValueError("embed_dim / num_heads must be an integer multiple of 4 for RoPE")
+        if not isinstance(ffn_ratio, (int, float)) or not 0 < ffn_ratio < float("inf") or int(embed_dim * ffn_ratio) < 1:
+            raise ValueError("ffn_ratio must be finite and produce a positive hidden dimension")
+        if kwargs.get("ffn_layer", "mlp") != "mlp":
             raise ValueError("This implementation currently supports ffn_layer='mlp' only")
-        if self.norm_layer not in ("layernorm", "layernormbf16", "rmsnorm"):
-            raise ValueError(f"Unsupported elastic norm {self.norm_layer!r}")
-
+        if kwargs.get("norm_layer", "layernorm") not in ("layernorm", "layernormbf16", "rmsnorm"):
+            raise ValueError(f"Unsupported elastic norm {kwargs['norm_layer']!r}")
+        self.head_dim = embed_dim // num_heads
+        self.splits = dict(splits) if splits is not None else {"full": (embed_dim, depth)}
+        if not self.splits:
+            raise ValueError("splits must contain at least one named subnetwork")
+        # Validate before allocating a potentially large model.
+        for name, split in self.splits.items():
+            if not isinstance(name, str) or not name or not isinstance(split, (tuple, list)) or len(split) != 2:
+                raise ValueError("splits must map nonempty names to (width, depth) pairs")
+            width, sub_depth = split
+            if type(width) is not int or not self.head_dim <= width <= embed_dim or width % self.head_dim:
+                raise ValueError(f"split {name!r}: width must be a multiple of {self.head_dim} up to {embed_dim}")
+            if type(sub_depth) is not int or not 1 <= sub_depth <= depth:
+                raise ValueError(f"split {name!r}: depth must be an integer from 1 to {depth}")
+        self.splits = {name: tuple(split) for name, split in self.splits.items()}
+        self._quant_dims = {}
+        for name, default in (("sattn_qkv_quant_dim", 0), ("sattn_fc1_quant_dim", 0), ("sattn_fc2_quant_dim", 1)):
+            value = kwargs.get(name, default)
+            if not isinstance(value, int) and len(value) != depth:
+                raise ValueError(f"{name} must have one entry per block ({depth})")
+            self._quant_dims[name] = deepcopy(value)
+        super().__init__(
+            patch_size=patch_size, embed_dim=embed_dim, depth=depth,
+            num_heads=num_heads, ffn_ratio=ffn_ratio, **kwargs,
+        )
         # The parent builds the ordinary, unmodified model. Replace its blocks
         # without changing the names in their state_dict (blocks.i.*).
         norm_factory = (
-            MatryoshkaRMSNorm if self.norm_layer == "rmsnorm"
+            partial(MatryoshkaRMSNorm, eps=1e-5) if self.norm_layer == "rmsnorm"
             else partial(MatryoshkaLayerNorm, eps=(1e-5 if self.norm_layer == "layernormbf16" else 1e-6))
         )
         def per_block(v, i):
@@ -71,11 +86,13 @@ class DinoVisionMatryoshkaMicro(DinoVisionTransformer):
         qdim = kwargs.get("sattn_qkv_quant_dim", 0)
         fc1dim = kwargs.get("sattn_fc1_quant_dim", 0)
         fc2dim = kwargs.get("sattn_fc2_quant_dim", 1)
+        # Release the original stack before allocating its elastic replacement.
+        del self.blocks
         self.blocks = nn.ModuleList([
             SelfMatryoshkaAttentionBlock(
-                dim=128,
-                num_heads=4,
-                ffn_ratio=2.0,
+                dim=embed_dim,
+                num_heads=num_heads,
+                ffn_ratio=ffn_ratio,
                 qkv_bias=self.qkv_bias,
                 proj_bias=self.proj_bias,
                 ffn_bias=self.ffn_bias,
@@ -90,26 +107,27 @@ class DinoVisionMatryoshkaMicro(DinoVisionTransformer):
             )
             for i in range(self.depth)
         ])
-        self.norm = norm_factory(128).to(device=self.device)
+        self.norm = norm_factory(embed_dim).to(device=self.device)
         if self.cls_norm is not None:
-            self.cls_norm = norm_factory(128).to(device=self.device)
+            self.cls_norm = norm_factory(embed_dim).to(device=self.device)
         if self.local_cls_norm is not None:
-            self.local_cls_norm = norm_factory(128).to(device=self.device)
+            self.local_cls_norm = norm_factory(embed_dim).to(device=self.device)
         # Parameter initialisation follows the parent contract: call
         # model.init_weights() just as for the standard DinoVisionTransformer.
 
-    @staticmethod
-    def _resolve(width: int, depth: Optional[int], out_dim: Optional[int]):
-        allowed = {w: d for w, d in SPLITS.values()}
-        if width not in allowed:
-            raise ValueError(f"width must be one of {tuple(allowed)}, got {width}")
+    def _resolve(self, width: Optional[int], depth: Optional[int], out_dim: Optional[int]):
+        width = self.embed_dim if width is None else width
+        if type(width) is not int or not self.head_dim <= width <= self.embed_dim or width % self.head_dim:
+            raise ValueError(f"width must be a multiple of {self.head_dim} between {self.head_dim} and {self.embed_dim}")
         if depth is None:
-            depth = allowed[width]
-        if not isinstance(depth, int) or not (1 <= depth <= 4):
-            raise ValueError("depth must be an integer from 1 to 4")
-        if out_dim is None:
-            out_dim = width
-        if not isinstance(out_dim, int) or not (1 <= out_dim <= width):
+            depths = {d for w, d in self.splits.values() if w == width}
+            if len(depths) > 1 and width != self.embed_dim:
+                raise ValueError("Multiple splits use this width; specify depth explicitly")
+            depth = self.depth if width == self.embed_dim or not depths else next(iter(depths))
+        if type(depth) is not int or not 1 <= depth <= self.depth:
+            raise ValueError(f"depth must be an integer from 1 to {self.depth}")
+        out_dim = width if out_dim is None else out_dim
+        if type(out_dim) is not int or not 1 <= out_dim <= width:
             raise ValueError("out_dim must be an integer in [1, width]")
         return width, depth, out_dim
 
@@ -148,9 +166,9 @@ class DinoVisionMatryoshkaMicro(DinoVisionTransformer):
         return self.patch_embed(images)[..., :width]
 
     def prepare_tokens_with_masks(
-        self, x: Tensor, masks: Optional[Tensor] = None, *, width: int = 128
+        self, x: Tensor, masks: Optional[Tensor] = None, *, width: Optional[int] = None
     ):
-        self._resolve(width, None, None)
+        width, _, _ = self._resolve(width, self.depth, None)
         # PatchEmbed / PatchEmbedNoConv returns [B,H,W,width].
         patches = self._embed_patches(x, width)
         bsz, h, w, _ = patches.shape
@@ -175,7 +193,7 @@ class DinoVisionMatryoshkaMicro(DinoVisionTransformer):
         x_list: List[Tensor],
         masks_list: Optional[List[Optional[Tensor]]] = None,
         *,
-        width: int = 128,
+        width: Optional[int] = None,
         depth: Optional[int] = None,
         out_dim: Optional[int] = None,
     ) -> List[Dict[str, Tensor]]:
@@ -221,7 +239,7 @@ class DinoVisionMatryoshkaMicro(DinoVisionTransformer):
         x: Union[Tensor, List[Tensor]],
         masks: Optional[Union[Tensor, List[Optional[Tensor]]]] = None,
         *,
-        width: int = 128,
+        width: Optional[int] = None,
         depth: Optional[int] = None,
         out_dim: Optional[int] = None,
     ):
@@ -238,7 +256,7 @@ class DinoVisionMatryoshkaMicro(DinoVisionTransformer):
         x: Union[Tensor, List[Tensor]],
         masks=None,
         *,
-        width: int = 128,
+        width: Optional[int] = None,
         depth: Optional[int] = None,
         out_dim: Optional[int] = None,
         is_training: bool = False,
@@ -251,33 +269,8 @@ class DinoVisionMatryoshkaMicro(DinoVisionTransformer):
         return self.head(ret["x_norm_clstoken"])
 
     def clone(self):
-        clone = self.__class__(
-            patch_size=self.patch_size,
-            img_size=self.img_size,
-            in_chans=self.in_chans,
-            pos_embed_rope_base=self.pos_embed_rope_base,
-            pos_embed_rope_min_period=self.pos_embed_rope_min_period,
-            pos_embed_rope_max_period=self.pos_embed_rope_max_period,
-            pos_embed_rope_normalize_coords=self.pos_embed_rope_normalize_coords,
-            pos_embed_rope_shift_coords=self.pos_embed_rope_shift_coords,
-            pos_embed_rope_jitter_coords=self.pos_embed_rope_jitter_coords,
-            pos_embed_rope_rescale_coords=self.pos_embed_rope_rescale_coords,
-            pos_embed_rope_dtype=self.pos_embed_rope_dtype,
-            qkv_bias=self.qkv_bias,
-            drop_path_rate=self.drop_path_rate,
-            layerscale_init=self.layerscale_init,
-            norm_layer=self.norm_layer,
-            ffn_layer=self.ffn_layer,
-            ffn_bias=self.ffn_bias,
-            proj_bias=self.proj_bias,
-            n_storage_tokens=self.n_storage_tokens,
-            mask_k_bias=self.mask_k_bias,
-            untie_cls_and_patch_norms=self.untie_cls_and_patch_norms,
-            untie_global_and_local_cls_norm=self.untie_global_and_local_cls_norm,
-            no_conv=self.no_conv,
-        ).to(device=self.cls_token.device, dtype=self.cls_token.dtype)
-        clone.load_state_dict(self.state_dict(), strict=True)
-        return clone
+        """Copy weights, architecture, quantizer settings and train/eval mode."""
+        return deepcopy(self)
 
     def export_subnetwork(self, name: str) -> DinoVisionTransformer:
         """Return a compact, *ordinary* DINOv3 model with prefix-copied weights.
@@ -286,9 +279,9 @@ class DinoVisionMatryoshkaMicro(DinoVisionTransformer):
         BitLinear ternary freeze/export must be applied separately, with
         the width-specific quantization scale recomputed AFTER slicing.
         """
-        if name not in SPLITS:
-            raise ValueError(f"name must be one of {tuple(SPLITS)}, got {name!r}")
-        width, depth = SPLITS[name]
+        if name not in self.splits:
+            raise ValueError(f"name must be one of {tuple(self.splits)}, got {name!r}")
+        width, depth = self.splits[name]
         target = DinoVisionTransformer(
             img_size=self.img_size,
             patch_size=self.patch_size,
@@ -303,8 +296,8 @@ class DinoVisionMatryoshkaMicro(DinoVisionTransformer):
             pos_embed_rope_dtype=self.pos_embed_rope_dtype,
             embed_dim=width,
             depth=depth,
-            num_heads=width // HEAD_DIM,
-            ffn_ratio=2.0,
+            num_heads=width // self.head_dim,
+            ffn_ratio=self.ffn_ratio,
             qkv_bias=self.qkv_bias,
             drop_path_rate=self.drop_path_rate,
             layerscale_init=self.layerscale_init,
@@ -317,7 +310,24 @@ class DinoVisionMatryoshkaMicro(DinoVisionTransformer):
             untie_cls_and_patch_norms=self.untie_cls_and_patch_norms,
             untie_global_and_local_cls_norm=self.untie_global_and_local_cls_norm,
             no_conv=self.no_conv,
+            **{key: value if isinstance(value, int) else value[:depth]
+               for key, value in self._quant_dims.items()},
         ).to(device=self.cls_token.device, dtype=self.cls_token.dtype)
+
+        # The elastic MLP scales the already rounded full hidden dimension.
+        # For fractional ratios this can differ from int(width * ffn_ratio).
+        def per_block_quant(value, index):
+            return value if isinstance(value, int) else value[index]
+
+        hidden_dim = max(1, self.blocks[0].mlp.fc1.out_features * width // self.embed_dim)
+        target.ffn_ratio = hidden_dim / width
+        for i, block in enumerate(target.blocks):
+            if block.mlp.fc1.out_features != hidden_dim:
+                block.mlp = Mlp(
+                    in_features=width, hidden_features=hidden_dim, bias=self.ffn_bias,
+                    fc1_quant_dim=per_block_quant(self._quant_dims["sattn_fc1_quant_dim"], i),
+                    fc2_quant_dim=per_block_quant(self._quant_dims["sattn_fc2_quant_dim"], i),
+                ).to(device=self.cls_token.device, dtype=self.cls_token.dtype)
 
         source_sd = self.state_dict()
         small_sd = target.state_dict()
@@ -345,33 +355,78 @@ class DinoVisionMatryoshkaMicro(DinoVisionTransformer):
         return target
 
 
-def vit_matryoshka_micro(patch_size: int = 8, **kwargs):
-    """Micro width=128/depth=4, with Pico/Femto width/depth prefixes."""
-    return DinoVisionMatryoshkaMicro(patch_size=patch_size, **kwargs)
+# Width/depth follow the ordinary ViT presets. Prefixes share their parent's
+# FFN ratio and head dimension; Pico (96-wide) needs head_dim=32 instead.
+_DEFAULT_SPLITS = {
+    "large": (1024, 24),
+    "base": (768, 12),
+    "small": (384, 12),
+    "tiny": (256, 6),
+    "nano": (192, 6),
+    "micro": (128, 4),
+    "femto": (64, 3),
+}
 
 
-class MatryoshkaMNISTClassifier(nn.Module):
-    """Optional shared 10-class head for sandwich training on MNIST.
+def _downstream_splits(width: int, depth: int):
+    return {name: (w, d) for name, (w, d) in _DEFAULT_SPLITS.items()
+            if w <= width and d <= depth}
+
+
+def vit_matryoshka_small(patch_size: int = 16, **kwargs):
+    """384-wide, 12-block network with all compatible smaller presets."""
+    kwargs.setdefault("splits", _downstream_splits(384, 12))
+    return DinoVisionMatryoshka(patch_size=patch_size, embed_dim=384, depth=12,
+                               num_heads=6, ffn_ratio=4.0, **kwargs)
+
+
+def vit_matryoshka_base(patch_size: int = 16, **kwargs):
+    """768-wide, 12-block network with all compatible smaller presets."""
+    kwargs.setdefault("splits", _downstream_splits(768, 12))
+    return DinoVisionMatryoshka(patch_size=patch_size, embed_dim=768, depth=12,
+                               num_heads=12, ffn_ratio=4.0, **kwargs)
+
+
+def vit_matryoshka_large(patch_size: int = 16, **kwargs):
+    """1024-wide, 24-block network with all compatible smaller presets."""
+    kwargs.setdefault("splits", _downstream_splits(1024, 24))
+    return DinoVisionMatryoshka(patch_size=patch_size, embed_dim=1024, depth=24,
+                               num_heads=16, ffn_ratio=4.0, **kwargs)
+
+
+class MatryoshkaClassifier(nn.Module):
+    """Shared classification head for sandwich training at any backbone size.
 
     Head rows represent classes; head columns are prefix-sliced so each
     width gets a genuine w->num_classes matrix multiplication.
     """
 
-    def __init__(self, num_classes: int = 10, *, backbone: Optional[DinoVisionMatryoshkaMicro] = None, **kwargs):
+    def __init__(self, num_classes: int = 10, *, backbone: Optional[DinoVisionMatryoshka] = None, **kwargs):
         super().__init__()
-        self.backbone = backbone if backbone is not None else vit_matryoshka_micro(**kwargs)
-        self.classifier = nn.Linear(128, num_classes)
+        self.backbone = backbone if backbone is not None else DinoVisionMatryoshka(**kwargs)
+        self.classifier = nn.Linear(self.backbone.embed_dim, num_classes).to(
+            device=self.backbone.cls_token.device, dtype=self.backbone.cls_token.dtype
+        )
 
-    def forward(self, images: Tensor, *, name: str = "micro") -> Tensor:
-        if name not in SPLITS:
+    @property
+    def splits(self):
+        return self.backbone.splits
+
+    def forward(self, images: Tensor, *, name: Optional[str] = None) -> Tensor:
+        if name is None:
+            width, depth = self.backbone.embed_dim, self.backbone.depth
+        elif name not in self.splits:
             raise ValueError(f"Unknown subnet {name!r}")
-        width, depth = SPLITS[name]
+        else:
+            width, depth = self.splits[name]
         cls = self.backbone(images, width=width, depth=depth)
         return F.linear(cls, self.classifier.weight[:, :width], self.classifier.bias)
 
     def export_subnetwork(self, name: str) -> nn.Module:
         """Return a standalone classifier with the ordinary reduced ViT."""
-        width, _ = SPLITS[name]
+        if name not in self.splits:
+            raise ValueError(f"Unknown subnet {name!r}")
+        width, _ = self.splits[name]
         model = _StandaloneClassifier(self.backbone.export_subnetwork(name), width, self.classifier.out_features)
         with torch.no_grad():
             model.classifier.weight.copy_(self.classifier.weight[:, :width])
@@ -393,18 +448,17 @@ class _StandaloneClassifier(nn.Module):
 
 
 def build_standalone_classifier(
-    name: str, *, num_classes: int = 10, patch_size: int = 8, **backbone_kwargs
+    name: str, *, splits: Mapping[str, tuple[int, int]], head_dim: int,
+    num_classes: int = 10, patch_size: int = 16, ffn_ratio: float = 4.0, **backbone_kwargs
 ) -> nn.Module:
-    """Rebuild an exported split without allocating the full 128-wide model.
+    """Rebuild an exported split without allocating the shared model.
 
-    Example:
-        small = build_standalone_classifier('femto', img_size=32, no_conv=True)
-        small.load_state_dict(torch.load('femto_extracted.pt',
-                                         weights_only=True)['state_dict'])
+    Pass the source's splits and head_dim, the exported FFN ratio, and the
+    original patch/image settings before loading the exported state_dict.
     """
-    if name not in SPLITS:
-        raise ValueError(f"name must be one of {tuple(SPLITS)}, got {name!r}")
-    width, depth = SPLITS[name]
+    if name not in splits:
+        raise ValueError(f"name must be one of {tuple(splits)}, got {name!r}")
+    width, depth = splits[name]
     for reserved in ('embed_dim', 'depth', 'num_heads', 'ffn_ratio'):
         if reserved in backbone_kwargs:
             raise TypeError(f"{reserved} is determined by the split name")
@@ -412,8 +466,8 @@ def build_standalone_classifier(
         patch_size=patch_size,
         embed_dim=width,
         depth=depth,
-        num_heads=width // HEAD_DIM,
-        ffn_ratio=2.0,
+        num_heads=width // head_dim,
+        ffn_ratio=ffn_ratio,
         **backbone_kwargs,
     )
     return _StandaloneClassifier(backbone, width, num_classes)

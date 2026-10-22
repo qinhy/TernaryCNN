@@ -41,7 +41,7 @@ class LinearKMaskedBias(BitLinear):
         if hasattr(self, "_inner") and hasattr(self._inner.linear, "w_q"):
             wq = self._inner.linear.w_q(self._inner.linear.weight)
             return F.linear(input, wq, masked_bias)
-        return F.linear(input, self.weight, masked_bias)
+        return F.linear(input, self.w_q(self.weight), masked_bias)
 
 
 class SelfAttention(nn.Module):

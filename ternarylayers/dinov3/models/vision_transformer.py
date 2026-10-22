@@ -189,7 +189,7 @@ class DinoVisionTransformer(nn.Module):
                 mask_k_bias=mask_k_bias,
                 device=device,
 
-                qkv_quant_dim=sattn_qkv_quant_dim,
+                qkv_quant_dim=sattn_qkv_quant_dim if isinstance(sattn_qkv_quant_dim,int) else sattn_qkv_quant_dim[i],
                 fc1_quant_dim=sattn_fc1_quant_dim if isinstance(sattn_fc1_quant_dim,int) else sattn_fc1_quant_dim[i],
                 fc2_quant_dim=sattn_fc2_quant_dim if isinstance(sattn_fc2_quant_dim,int) else sattn_fc2_quant_dim[i],
             )

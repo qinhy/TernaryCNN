@@ -9,9 +9,17 @@ from ternarylayers.dinov3.layers.attention import (
 from ternarylayers.dinov3.layers.bitlayers import Conv2d, Linear
 from ternarylayers.dinov3.layers.block import MatryoshkaLayerNorm, SelfAttentionBlock, SelfMatryoshkaAttentionBlock
 from ternarylayers.dinov3.layers.ffn_layers import MatryoshkaMlp, Mlp
-from ternarylayers.dinov3.layers.layer_scale import MatryoshkaLayerScale
+from ternarylayers.dinov3.layers.layer_scale import LayerScale, MatryoshkaLayerScale
 from ternarylayers.dinov3.layers.rms_norm import MatryoshkaRMSNorm
 from ternarylayers.dinov3.models.vision_transformer import vit_femto
+
+
+def initialize_layerscales(module):
+    # LayerScale follows DINOv3's explicit initialization contract.
+    for layer in module.modules():
+        if isinstance(layer, LayerScale):
+            layer.reset_parameters()
+    return module
 
 
 def test_bitlinear_accepts_torch_constructor_keywords() -> None:
@@ -164,7 +172,7 @@ def test_matryoshka_mlp_list_and_invalid_widths() -> None:
 
 @pytest.mark.parametrize("width", [16, 32, 48, 64])
 def test_widths_forward_backward(width):
-    block = SelfMatryoshkaAttentionBlock(dim=64, num_heads=4, init_values=0.5)
+    block = initialize_layerscales(SelfMatryoshkaAttentionBlock(dim=64, num_heads=4, init_values=0.5))
     x = torch.randn(2, 7, width, requires_grad=True)
     y = block(x)
     assert y.shape == x.shape and torch.isfinite(y).all()
@@ -174,7 +182,7 @@ def test_widths_forward_backward(width):
 
 def test_full_width_loads_original_checkpoint_and_matches_output():
     torch.manual_seed(123)
-    base = SelfAttentionBlock(dim=64, num_heads=4, init_values=0.5).eval()
+    base = initialize_layerscales(SelfAttentionBlock(dim=64, num_heads=4, init_values=0.5).eval())
     elastic = SelfMatryoshkaAttentionBlock(dim=64, num_heads=4, init_values=0.5).eval()
     assert set(base.state_dict()) == set(elastic.state_dict())
     elastic.load_state_dict(base.state_dict(), strict=True)
@@ -200,7 +208,7 @@ def test_mixed_widths_and_rope_with_cls_prefix():
 
 
 def test_mixed_widths_stochastic_depth_backward():
-    model = SelfMatryoshkaAttentionBlock(dim=64, num_heads=4, drop_path=0.5, init_values=0.5)
+    model = initialize_layerscales(SelfMatryoshkaAttentionBlock(dim=64, num_heads=4, drop_path=0.5, init_values=0.5))
     model.train()
     xs = [torch.randn(3, 6, 64, requires_grad=True), torch.randn(4, 5, 32, requires_grad=True)]
     outputs = model(xs)
@@ -224,7 +232,7 @@ def test_mismatched_list_rope_rejected():
 def test_width_aware_norm_and_layerscale():
     ln = MatryoshkaLayerNorm(64)
     rms = MatryoshkaRMSNorm(64)
-    ls = MatryoshkaLayerScale(64, 0.5)
+    ls = initialize_layerscales(MatryoshkaLayerScale(64, 0.5))
     for width in [16, 32, 64]:
         x = torch.randn(2, 5, width)
         torch.testing.assert_close(
@@ -240,7 +248,7 @@ def test_active_qkv_gradients_are_groupwise():
     # A width-32 subnet uses the first 32 channels from EACH Q, K, V group,
     # not the first 96 contiguous rows of the 192-row packed matrix.
     torch.manual_seed(7)
-    model = SelfMatryoshkaAttentionBlock(dim=64, num_heads=4, init_values=0.5)
+    model = initialize_layerscales(SelfMatryoshkaAttentionBlock(dim=64, num_heads=4, init_values=0.5))
     y = model(torch.randn(2, 8, 32)).square().sum()
     y.backward()
     grad = model.attn.qkv.weight.grad.reshape(3, 64, 64)
