@@ -9,6 +9,11 @@ from ternarylayers.dinov3.models.vision_transformer_matryoshka import (
     vit_matryoshka_large,
     vit_matryoshka_base,
     vit_matryoshka_small,
+    vit_matryoshka_tiny,
+    vit_matryoshka_nano,
+    vit_matryoshka_micro,
+    vit_matryoshka_pico,
+    vit_matryoshka_femto,
 )
 
 
@@ -88,19 +93,24 @@ def test_rebuild_generic_export():
 
 
 @pytest.mark.parametrize('factory,width,depth,heads', [
+    (vit_matryoshka_tiny, 256, 6, 4),
+    (vit_matryoshka_nano, 192, 6, 3),
+    (vit_matryoshka_micro, 128, 4, 2),
+    (vit_matryoshka_pico, 64, 6, 1),
+    (vit_matryoshka_femto, 64, 3, 1),
     (vit_matryoshka_small, 384, 12, 6),
     (vit_matryoshka_base, 768, 12, 12),
     (vit_matryoshka_large, 1024, 24, 16),
 ])
-def test_larger_presets_on_meta(factory, width, depth, heads):
+def test_presets_on_meta(factory, width, depth, heads):
     model = factory(device='meta')
     assert (model.embed_dim, model.depth, model.num_heads) == (width, depth, heads)
     assert model.head_dim == 64
     assert all(block.attn.qkv.weight.is_meta for block in model.blocks)
     assert len(model.blocks) == depth
     expected = {'large': (1024, 24), 'base': (768, 12), 'small': (384, 12),
-                'tiny': (256, 6), 'nano': (192, 6), 'micro': (128, 4), 'femto': (64, 3)}
-    assert model.splits == {name: pair for name, pair in expected.items() if pair[0] <= width}
+                'tiny': (256, 6), 'nano': (192, 6), 'micro': (128, 4), 'pico': (64, 6), 'femto': (64, 3)}
+    assert model.splits == {name: pair for name, pair in expected.items() if pair[0] <= width and pair[1] <= depth}
 
 
 @pytest.mark.parametrize('kwargs', [
@@ -167,3 +177,34 @@ def test_masked_qkv_quantizes_weights():
     expected = torch.nn.functional.linear(x, layer.w_q(layer.weight),
                                           layer.bias * layer.bias_mask)
     torch.testing.assert_close(layer(x), expected)
+
+
+def test_pico_standalone_matches_matryoshka_export():
+    from ternarylayers.dinov3.models.vision_transformer import vit_pico
+
+    parent = make_backbone(img_size=32, patch_size=16, depth=6,
+                           num_heads=4, ffn_ratio=4.0, splits={'pico': (64, 6)}).eval()
+    compact = parent.export_subnetwork('pico')
+    standalone = vit_pico(img_size=32, no_conv=True,
+                          pos_embed_rope_dtype='fp32').eval()
+    assert (standalone.embed_dim, standalone.depth, standalone.num_heads,
+            standalone.ffn_ratio) == (64, 6, 1, 4.0)
+    assert sum(p.numel() for p in standalone.parameters()) == 349376
+    standalone.load_state_dict(compact.state_dict(), strict=True)
+    images = torch.randn(2, 3, 32, 32)
+    with torch.no_grad():
+        torch.testing.assert_close(parent(images, width=64, depth=6), standalone(images))
+
+
+@pytest.mark.parametrize('factory', [vit_matryoshka_tiny, vit_matryoshka_nano,
+                                   vit_matryoshka_micro, vit_matryoshka_pico,
+                                   vit_matryoshka_femto])
+def test_smaller_factory_subnetworks_match_exports(factory):
+    backbone = factory(img_size=16, patch_size=8, no_conv=True, pos_embed_rope_dtype='fp32')
+    backbone.init_weights()
+    model = MatryoshkaClassifier(backbone=backbone).eval()
+    images = torch.randn(1, 3, 16, 16)
+    with torch.no_grad():
+        for name in model.splits:
+            compact = model.export_subnetwork(name)
+            torch.testing.assert_close(model(images, name=name), compact(images))

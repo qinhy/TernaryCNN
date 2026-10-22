@@ -49,9 +49,14 @@ compact = model.export_subnetwork("small")
 
 | Factory | Largest width / depth / heads | Default prefixes |
 | --- | --- | --- |
-| `vit_matryoshka_small` | 384 / 12 / 6 | Tiny 256 / 6, Nano 192 / 6, Micro 128 / 4, Femto 64 / 3 |
-| `vit_matryoshka_base` | 768 / 12 / 12 | Small, Tiny, Nano, Micro, Femto |
-| `vit_matryoshka_large` | 1024 / 24 / 16 | Base, Small, Tiny, Nano, Micro, Femto |
+| `vit_matryoshka_femto` | 64 / 3 / 1 | None |
+| `vit_matryoshka_pico` | 64 / 6 / 1 | Femto 64 / 3 |
+| `vit_matryoshka_micro` | 128 / 4 / 2 | Femto 64 / 3 |
+| `vit_matryoshka_nano` | 192 / 6 / 3 | Micro 128 / 4, Pico 64 / 6, Femto 64 / 3 |
+| `vit_matryoshka_tiny` | 256 / 6 / 4 | Nano, Micro, Pico, Femto |
+| `vit_matryoshka_small` | 384 / 12 / 6 | Tiny 256 / 6, Nano 192 / 6, Micro 128 / 4, Pico 64 / 6, Femto 64 / 3 |
+| `vit_matryoshka_base` | 768 / 12 / 12 | Small, Tiny, Nano, Micro, Pico, Femto |
+| `vit_matryoshka_large` | 1024 / 24 / 16 | Base, Small, Tiny, Nano, Micro, Pico, Femto |
 
 For a custom hierarchy, configure the largest network directly:
 
@@ -69,14 +74,24 @@ features = backbone(images, width=512, depth=12)  # [batch, 512]
 
 The attention head dimension stays fixed: `embed_dim // num_heads`. Every split
 width must be a multiple of it, and each split depth must fit the largest network.
-The factories use head dimension 64. Custom configurations can use 32 to
-include widths such as Pico's 96. Pico is excluded from the default hierarchies
-because 96 is not divisible by 64. Tiny and Nano use the width/depth pairs from
+The factories use head dimension 64. Pico uses width 64, depth 6, one head,
+and FFN ratio 4.0 in both `vit_pico` and the default Matryoshka hierarchy.
+With patch size 16 and three input channels, its backbone has **349,376 parameters**
+(excluding a classification head). Patch size 8 gives 312,512 parameters at
+the same depth; a custom depth of 7 gives 362,496 parameters at patch size 8.
+The former standalone Pico configuration (96 / 4 / 3 / 2) requires an explicit
+`DinoVisionTransformer` configuration; its checkpoints do not fit the new preset. Tiny and Nano use the width/depth pairs from
 the ordinary repo presets. Micro, Nano, and Femto prefixes share the parent's FFN ratio
 of 4 rather than their ordinary presets' ratio of 2.
-All prefixes share the FFN ratio and support MLP FFNs with LayerNorm or RMSNorm.
-An omitted width/depth runs the full network; a named reduced width uses its
-configured depth. `out_dim` only truncates output features after the blocks.
+All Matryoshka factories use FFN ratio 4.0 and head dimension 64, and support
+MLP FFNs with LayerNorm or RMSNorm. Tiny/Nano/Micro default to patch size 8;
+Pico/Femto/Small/Base/Large default to 16. Override `patch_size` explicitly when
+sharing checkpoints across factories. A prefix must fit both the parent width
+and depth: Micro excludes the six-block Pico; Femto contains only itself.
+An omitted width/depth runs the full network. A reduced width uses its configured
+depth when unambiguous. Pico and Femto both use width 64, so select them through
+`model(images, name="pico")` or `model(images, name="femto")` on the classifier or pass `width=64, depth=6`
+for Pico and `width=64, depth=3` for Femto to the backbone. `out_dim` only truncates output features after the blocks.
 
 `no_conv=True` slices the patch projector before quantization. Convolutional
 patch embeddings use a full projection followed by a channel prefix; their
@@ -93,7 +108,8 @@ for the hidden dimension rounded when selecting a prefix.
 Matching ordinary ternary `DinoVisionTransformer` checkpoints can be loaded with
 `load_state_dict`; pretrained weights are not downloaded by these factories.
 
-The MNIST example defaults to Small and also accepts Base or Large:
+The MNIST example defaults to Small and accepts all eight presets through `--arch`
+(`femto`, `pico`, `micro`, `nano`, `tiny`, `small`, `base`, `large`):
 
 ```bash
 uv run python examples/train_mnist_matryoshka.py --arch large --batch-size 8 \

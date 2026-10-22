@@ -356,7 +356,7 @@ class DinoVisionMatryoshka(DinoVisionTransformer):
 
 
 # Width/depth follow the ordinary ViT presets. Prefixes share their parent's
-# FFN ratio and head dimension; Pico (96-wide) needs head_dim=32 instead.
+# FFN ratio and head dimension. Pico also shares the ordinary FFN ratio.
 _DEFAULT_SPLITS = {
     "large": (1024, 24),
     "base": (768, 12),
@@ -364,6 +364,7 @@ _DEFAULT_SPLITS = {
     "tiny": (256, 6),
     "nano": (192, 6),
     "micro": (128, 4),
+    "pico": (64, 6),
     "femto": (64, 3),
 }
 
@@ -372,26 +373,53 @@ def _downstream_splits(width: int, depth: int):
     return {name: (w, d) for name, (w, d) in _DEFAULT_SPLITS.items()
             if w <= width and d <= depth}
 
+def vit_matryoshka_femto(patch_size: int = 16, **kwargs):
+    """64-wide, 3-block network with all compatible smaller presets."""
+    kwargs.setdefault("splits", _downstream_splits(64, 3))
+    return DinoVisionMatryoshka(patch_size=patch_size, embed_dim=64, depth=3,
+                                num_heads=1, ffn_ratio=4.0, **kwargs)
+
+def vit_matryoshka_pico(patch_size: int = 16, **kwargs):
+    """64-wide, 6-block network with all compatible smaller presets."""
+    kwargs.setdefault("splits", _downstream_splits(64, 6))
+    return DinoVisionMatryoshka(patch_size=patch_size, embed_dim=64, depth=6,
+                                num_heads=1, ffn_ratio=4.0, **kwargs)
+
+def vit_matryoshka_micro(patch_size: int = 8, **kwargs):
+    """128-wide, 4-block network with all compatible smaller presets."""
+    kwargs.setdefault("splits", _downstream_splits(128, 4))
+    return DinoVisionMatryoshka(patch_size=patch_size, embed_dim=128, depth=4,
+                                num_heads=2, ffn_ratio=4.0, **kwargs)
+
+def vit_matryoshka_nano(patch_size: int = 8, **kwargs):
+    """192-wide, 6-block network with all compatible smaller presets."""
+    kwargs.setdefault("splits", _downstream_splits(192, 6))
+    return DinoVisionMatryoshka(patch_size=patch_size, embed_dim=192, depth=6,
+                                num_heads=3, ffn_ratio=4.0, **kwargs)
+
+def vit_matryoshka_tiny(patch_size: int = 8, **kwargs):
+    """256-wide, 6-block network with all compatible smaller presets."""
+    kwargs.setdefault("splits", _downstream_splits(256, 6))
+    return DinoVisionMatryoshka(patch_size=patch_size, embed_dim=256, depth=6,
+                                num_heads=4, ffn_ratio=4.0, **kwargs)
 
 def vit_matryoshka_small(patch_size: int = 16, **kwargs):
     """384-wide, 12-block network with all compatible smaller presets."""
     kwargs.setdefault("splits", _downstream_splits(384, 12))
     return DinoVisionMatryoshka(patch_size=patch_size, embed_dim=384, depth=12,
-                               num_heads=6, ffn_ratio=4.0, **kwargs)
-
+                                num_heads=6, ffn_ratio=4.0, **kwargs)
 
 def vit_matryoshka_base(patch_size: int = 16, **kwargs):
     """768-wide, 12-block network with all compatible smaller presets."""
     kwargs.setdefault("splits", _downstream_splits(768, 12))
     return DinoVisionMatryoshka(patch_size=patch_size, embed_dim=768, depth=12,
-                               num_heads=12, ffn_ratio=4.0, **kwargs)
-
+                                num_heads=12, ffn_ratio=4.0, **kwargs)
 
 def vit_matryoshka_large(patch_size: int = 16, **kwargs):
     """1024-wide, 24-block network with all compatible smaller presets."""
     kwargs.setdefault("splits", _downstream_splits(1024, 24))
     return DinoVisionMatryoshka(patch_size=patch_size, embed_dim=1024, depth=24,
-                               num_heads=16, ffn_ratio=4.0, **kwargs)
+                                num_heads=16, ffn_ratio=4.0, **kwargs)
 
 
 class MatryoshkaClassifier(nn.Module):

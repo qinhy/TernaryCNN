@@ -415,14 +415,14 @@ def vit_femto(patch_size=16, cls=DinoVisionTransformer, **kwargs):
     return model
 
 def vit_pico(patch_size=16, cls=DinoVisionTransformer, **kwargs):
-    # 0.373344M params
-    # smaller than micro, good for very fast experiments
+    # 0.349376M params
+    # Shared standalone/Matryoshka architecture: width/depth/heads/FFN = 64/6/1/4.
     model = cls(
         patch_size=patch_size,
-        embed_dim=96,
-        depth=4,
-        num_heads=3,     # 96 % 3 == 0
-        ffn_ratio=2,
+        embed_dim=64,
+        depth=6,
+        num_heads=1,
+        ffn_ratio=4.0,
         **kwargs,
     )
     return model

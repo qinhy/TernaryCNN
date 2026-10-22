@@ -3,7 +3,7 @@
 Example:
     python train_mnist_matryoshka.py --epochs 20 --device auto
 
-Use --arch small, base or large to select the shared network.
+Use --arch femto, pico, micro, nano, tiny, small, base or large to select the shared network.
 Saves one shared student plus compact *learned-weight* exports for its splits.
 Exported weights have NOT been frozen into ternary integers;
 perform backend-specific quantization/export AFTER extraction.
@@ -22,6 +22,8 @@ from torchvision import datasets, transforms
 from ternarylayers.dinov3.models.vision_transformer_matryoshka import (
     MatryoshkaClassifier, vit_matryoshka_small,
     vit_matryoshka_base, vit_matryoshka_large,
+    vit_matryoshka_tiny, vit_matryoshka_nano, vit_matryoshka_micro,
+    vit_matryoshka_pico, vit_matryoshka_femto,
 )
 
 
@@ -29,7 +31,7 @@ def args_parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--data-dir', type=Path, default=Path('data/mnist'))
     p.add_argument('--save-dir', type=Path, default=Path('checkpoints/mnist-matryoshka'))
-    p.add_argument('--arch', choices=('small', 'base', 'large'), default='small')
+    p.add_argument('--arch', choices=('femto', 'pico', 'micro', 'nano', 'tiny', 'small', 'base', 'large'), default='nano')
     p.add_argument('--epochs', type=int, default=20)
     p.add_argument('--batch-size', type=int, default=128)
     p.add_argument('--learning-rate', type=float, default=3e-4)
@@ -110,7 +112,9 @@ def main():
     test_loader = DataLoader(dataset(args.data_dir, False, args.limit_test),
                              shuffle=False, **loader_args)
 
-    factories = dict(small=vit_matryoshka_small,
+    factories = dict(femto=vit_matryoshka_femto, pico=vit_matryoshka_pico,
+                     micro=vit_matryoshka_micro, nano=vit_matryoshka_nano,
+                     tiny=vit_matryoshka_tiny, small=vit_matryoshka_small,
                      base=vit_matryoshka_base, large=vit_matryoshka_large)
     backbone = factories[args.arch](img_size=32, patch_size=8, no_conv=True)
     largest_name = max(backbone.splits, key=lambda name: backbone.splits[name])
