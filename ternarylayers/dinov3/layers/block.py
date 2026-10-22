@@ -12,9 +12,9 @@ from torch import Tensor, nn
 from ternarylayers.dinov3.layers.bitlayers import Linear
 from ternarylayers.dinov3.utils import cat_keep_shapes, uncat_with_shapes
 
-from .attention import CausalSelfAttention, SelfAttention
-from .ffn_layers import Mlp
-from .layer_scale import LayerScale  # , DropPath
+from .attention import CausalSelfAttention, SelfAttention, SelfMatryoshkaAttention
+from .ffn_layers import MatryoshkaMlp, Mlp
+from .layer_scale import LayerScale, MatryoshkaLayerScale  # , DropPath
 
 torch._dynamo.config.automatic_dynamic_shapes = False
 torch._dynamo.config.accumulated_cache_size_limit = 1024
@@ -568,6 +568,143 @@ class CausalSelfAttentionBlock(nn.Module):
         return x_ffn
 
 
+class MatryoshkaLayerNorm(nn.LayerNorm):
+    """LayerNorm of the active channel prefix, with standard LayerNorm keys.
+
+    The stored affine weights have size max_dim; smaller widths use the
+    corresponding weight/bias prefixes. Statistics are computed ONLY over
+    active channels. At full width the original PyTorch path is preserved.
+    """
+
+    def __init__(
+        self,
+        normalized_shape: int,
+        eps: float = 1e-5,
+        elementwise_affine: bool = True,
+        bias: bool = True,
+        device=None,
+        dtype=None,
+    ) -> None:
+        if not isinstance(normalized_shape, int) or normalized_shape <= 0:
+            raise ValueError("MatryoshkaLayerNorm expects a positive channel dimension")
+        super().__init__(
+            normalized_shape,
+            eps=eps,
+            elementwise_affine=elementwise_affine,
+            bias=bias,
+            device=device,
+            dtype=dtype,
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        width = x.shape[-1]
+        max_width = self.normalized_shape[0]
+        if not (1 <= width <= max_width):
+            raise ValueError(f"Active width must be in [1, {max_width}], got {width}")
+        if width == max_width:
+            return super().forward(x)
+        weight = self.weight[:width] if self.weight is not None else None
+        bias = self.bias[:width] if self.bias is not None else None
+        return torch.nn.functional.layer_norm(x, (width,), weight=weight, bias=bias, eps=self.eps)
+
+
+class SelfMatryoshkaAttentionBlock(SelfAttentionBlock):
+    """Drop-in width-elastic SelfAttentionBlock with the same parameter names.
+
+    Active width comes from x.shape[-1], and must be a multiple of the
+    fixed head_dim = dim // num_heads. For mixed-width list inputs, execute
+    each item individually; concatenating them would be invalid. For a
+    uniform-width list, reuse the original optimized list implementation.
+
+    No .detach(), decoder or new projection head is introduced.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        ffn_ratio: float = 4.0,
+        qkv_bias: bool = False,
+        proj_bias: bool = True,
+        ffn_bias: bool = True,
+        drop: float = 0.0,
+        attn_drop: float = 0.0,
+        init_values=None,
+        drop_path: float = 0.0,
+        act_layer: Callable[..., nn.Module] = nn.GELU,
+        norm_layer: Callable[..., nn.Module] = MatryoshkaLayerNorm,
+        mask_k_bias: bool = False,
+        device=None,
+        qkv_quant_dim=0,
+        fc1_quant_dim=0,
+        fc2_quant_dim=1,
+    ) -> None:
+        if dim <= 0 or num_heads <= 0 or dim % num_heads:
+            raise ValueError("dim and num_heads must be positive and dim divisible by num_heads")
+        super().__init__(
+            dim=dim,
+            num_heads=num_heads,
+            ffn_ratio=ffn_ratio,
+            qkv_bias=qkv_bias,
+            proj_bias=proj_bias,
+            ffn_bias=ffn_bias,
+            drop=drop,
+            attn_drop=attn_drop,
+            init_values=init_values,
+            drop_path=drop_path,
+            act_layer=act_layer,
+            norm_layer=norm_layer,
+            attn_class=SelfMatryoshkaAttention,
+            ffn_layer=MatryoshkaMlp,
+            mask_k_bias=mask_k_bias,
+            device=device,
+            qkv_quant_dim=qkv_quant_dim,
+            fc1_quant_dim=fc1_quant_dim,
+            fc2_quant_dim=fc2_quant_dim,
+        )
+        self.head_dim = dim // num_heads
+        # Replace plain LayerScale with its width-aware version. The gamma
+        # parameter names and initial values remain checkpoint-compatible.
+        if init_values:
+            self.ls1 = MatryoshkaLayerScale(dim, init_values).to(device=device)
+            self.ls2 = MatryoshkaLayerScale(dim, init_values).to(device=device)
+
+    def _validate_tensor(self, x: Tensor) -> None:
+        if x.ndim != 3:
+            raise ValueError(f"Expected [batch, tokens, channels], got {tuple(x.shape)}")
+        width = x.shape[-1]
+        if not (self.head_dim <= width <= self.dim) or width % self.head_dim:
+            raise ValueError(
+                f"Width must be a multiple of head_dim={self.head_dim} "
+                f"in [{self.head_dim}, {self.dim}], got {width}"
+            )
+
+    def _forward_list(self, x_list: List[Tensor], rope_list=None) -> List[Tensor]:
+        if not x_list:
+            return []
+        if rope_list is None:
+            rope_list = [None] * len(x_list)
+        if len(rope_list) != len(x_list):
+            raise ValueError("x_list and rope_list must have the same length")
+        for x in x_list:
+            self._validate_tensor(x)
+
+        # Original DINOv3 batching works for uniform widths, and preserves
+        # its full-width forward-list execution and weight path exactly.
+        if all(x.shape[-1] == x_list[0].shape[-1] for x in x_list):
+            return super()._forward_list(x_list, rope_list=rope_list)
+
+        # Different widths cannot be concatenated before norm, QKV or MLP.
+        # Reuse the base block's single-tensor implementation (including
+        # its stochastic depth logic) instead of reimplementing the block.
+        return [self._forward(x, rope=rope) for x, rope in zip(x_list, rope_list)]
+
+    def forward(
+        self,
+        x_or_x_list: Union[Tensor, List[Tensor]],
+        rope_or_rope_list=None,
+    ) -> Union[Tensor, List[Tensor]]:
+        return super().forward(x_or_x_list, rope_or_rope_list)
 
 
 
