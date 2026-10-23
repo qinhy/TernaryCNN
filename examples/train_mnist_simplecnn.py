@@ -47,7 +47,9 @@ from ternarylayers.bit import (
 class SimpleCNN(nn.Module):
     """Small MNIST CNN using ternary-weight Bit layers."""
 
-    def __init__(self, channels: int = 8, num_classes: int = 10) -> None:
+    def __init__(self, channels: int = 8, num_classes: int = 10,
+                       norm=None # nn.BatchNorm2d
+                 ) -> None:
         super().__init__()
         if channels <= 0:
             raise ValueError("channels must be positive")
@@ -60,16 +62,30 @@ class SimpleCNN(nn.Module):
             padding=1,
             bias=True,
             scale_op="median",
+            dim=0,
         )
+
+        from ternarylayers.dev.prepbn2d import ScaledPRepBN2d
+        self.norm = ScaledPRepBN2d(num_features=channels)
+
+        # self.norm = nn.BatchNorm2d(num_features=channels)
+        # self.norm = None
+        if norm:
+            self.norm = norm(num_features=channels)
+
         self.fc = Bit.Linear(
             channels * 14 * 14,
             num_classes,
             bias=True,
             scale_op="median",
+            dim=1,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.conv(x)
+        if self.norm:
+            # x, (mean, var) = self.norm.forward_train_noncausal(x,lam=0.0)
+            x = self.norm(x)
         x = F.relu(x)
         x = F.max_pool2d(x, kernel_size=2, stride=2)
         x = torch.flatten(x, 1)
@@ -461,8 +477,9 @@ def print_fixed_point_metadata(model: nn.Module) -> None:
         print(f"{name}:")
         print(f"  input_scale  = {layer.input_scale:.10g}")
         print(f"  output_scale = {layer.output_scale:.10g}")
-        print(f"  M            = {layer.requant_M.detach().cpu().tolist()}")
-        print(f"  n            = {layer.requant_n.detach().cpu().tolist()}")
+        if layer.requant_M is not None:
+            print(f"  M            = {layer.requant_M.detach().cpu().tolist()}")
+            print(f"  n            = {layer.requant_n.detach().cpu().tolist()}")
 
 
 def save_training_checkpoint(
@@ -510,6 +527,40 @@ def save_ternary_checkpoint(
         path,
     )
     print(f"saved ternary/integer checkpoint: {path}")
+
+
+def summ(model, verbose=True, include_buffers=True):
+    info = []
+    for name, module in model.named_modules():
+        # parameters for this module only (no children)
+        params = list(module.parameters(recurse=False))
+        nparams = sum(p.numel() for p in params)
+
+        # collect dtypes from params (and optionally buffers)
+        tensors = params
+        if include_buffers:
+            tensors += list(module.buffers(recurse=False))
+
+        dtypes = {t.dtype for t in tensors}
+        if dtypes:
+            # e.g. "float32", "float16, int8"
+            dtype_str = ", ".join(
+                sorted(str(dt).replace("torch.", "") for dt in dtypes)
+            )
+        else:
+            dtype_str = "-" + " "*14
+
+        out_chs = ""
+        if hasattr(module,'out_channels'):
+            out_chs = f"out_channels={module.out_channels}"
+
+        row = (name, module.__class__.__name__, nparams, dtype_str)
+        info.append(row)
+
+        if verbose:
+            print(f"{name:35} {module.__class__.__name__:25} "
+                  f"params={nparams:8d}  dtypes={dtype_str:15} {out_chs}")
+    return info
 
 
 def main() -> None:
@@ -658,7 +709,7 @@ def main() -> None:
             output_scale=output_scale,
             integer_accuracy=integer_accuracy,
         )
-
+    return model
 
 if __name__ == "__main__":
-    main()
+    model = main()
