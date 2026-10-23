@@ -149,6 +149,41 @@ def train_demo(model, causal, shape, steps=6):
         print(f'  step={step:02d} lam={lam:.2f} loss={loss.item():.5f}')
 
 
+class ChannelAffine2d(nn.Module):
+    def __init__(self, num_features):
+        super().__init__()
+
+        self.register_buffer("scale", torch.ones(num_features))
+        self.register_buffer("bias", torch.zeros(num_features))
+
+    def add_pre_scale_bias(self, scale, bias=None):
+        if bias:
+            self.bias += self.scale*bias
+        self.scale *= scale
+
+    def add_pos_scale_bias(self, scale, bias=None):
+        if bias:
+            self.bias = scale*self.bias + bias
+        self.scale *= scale
+
+    def forward(self, x):
+        return (
+            x * self.scale.view(1, -1, 1, 1)
+            + self.bias.view(1, -1, 1, 1)
+        )
+
+    @classmethod
+    @torch.no_grad()
+    def from_ScaledPRepBN2d(cls, trained_ScaledPRepBN2d:ScaledPRepBN2d):
+        A, C_bias = trained_ScaledPRepBN2d.fused_affine()
+
+        layer = cls(A.numel()).to(device=A.device, dtype=A.dtype)
+        layer.scale.copy_(A)
+        layer.bias.copy_(C_bias)
+
+        return layer
+
+    
 def verify(model, causal, shape):
     model.eval()
     x = torch.randn(shape, device=model.pre_scale.device)
