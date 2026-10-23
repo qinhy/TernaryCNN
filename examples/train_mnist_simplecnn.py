@@ -102,6 +102,7 @@ def params_list_ternary_model(model:SimpleCNN)->list:
         model.norm.fused_affine() if model.norm else None,
         F.relu,
         (F.max_pool2d, 2, 2),
+        torch.flatten,
         model.fc.scale.detach(),
         model.fc.weight.detach(),
         model.fc.bias.detach(),
