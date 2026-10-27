@@ -4,7 +4,7 @@
 # the terms of the DINOv3 License Agreement.
 
 import math
-from typing import List, Tuple
+from typing import List, Literal, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -273,3 +273,200 @@ class CausalSelfAttention(nn.Module):
         x = x.transpose(1, 2).contiguous().view(B, N, C)
         x = self.proj_drop(self.proj(x))
         return x
+
+class DotPlusAttentionMixin:
+    """Mixin to compose BEFORE the user's SelfAttention in the MRO.
+
+    All existing SelfAttention constructor arguments and method signatures stay
+    valid. Extra keyword-only arguments control the experimental attention core.
+
+    score_op: 'dot_plus' (negative L1) or 'dot' (ordinary dot product).
+    value_op: 'dot_plus' (negative L1 reduction) or 'matmul'.
+    value_reduction: 'sum' is the literal dot-plus; 'mean' normalizes by the
+        number of included keys, stabilizing magnitudes across sequence lengths.
+    temperature_init: Positive scalar per-head initial temperature, or None
+        for the variance-based initialization.
+    is_causal: Whether each token may only read itself and preceding tokens.
+    query_chunk_size: Limits peak memory of masked dot-plus aggregation.
+
+    Supported attn_bias: None, bool (True=allowed, as in SDPA), or additive
+    floating tensor (use -inf to exclude). Shapes [N,N], [B,N,N], [B,H,N,N]
+    and broadcast-compatible 4D versions. No xFormers AttentionBias objects.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        qkv_bias: bool = False,
+        proj_bias: bool = True,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+        mask_k_bias: bool = False,
+        device=None,
+        qkv_quant_dim=0,
+        *,
+        score_op: Literal["dot_plus", "dot"] = "dot_plus",
+        value_op: Literal["dot_plus", "matmul"] = "dot_plus",
+        value_reduction: Literal["sum", "mean"] = "sum",
+        learnable_temperature: bool = True,
+        temperature_init: float | None = None,
+        is_causal: bool = False,
+        query_chunk_size: int = 16,
+    ) -> None:
+        if dim <= 0 or num_heads <= 0 or dim % num_heads != 0:
+            raise ValueError("dim must be > 0 and divisible by num_heads")
+        if score_op not in ("dot_plus", "dot"):
+            raise ValueError("score_op must be 'dot_plus' or 'dot'")
+        if value_op not in ("dot_plus", "matmul"):
+            raise ValueError("value_op must be 'dot_plus' or 'matmul'")
+        if value_reduction not in ("sum", "mean"):
+            raise ValueError("value_reduction must be 'sum' or 'mean'")
+        if query_chunk_size < 1:
+            raise ValueError("query_chunk_size must be >= 1")
+        if not 0 <= attn_drop < 1:
+            raise ValueError("attn_drop must be in [0, 1)")
+
+        # Calls the user's original SelfAttention.__init__.
+        super().__init__(
+            dim=dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            proj_bias=proj_bias,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+            mask_k_bias=mask_k_bias,
+            device=device,
+            qkv_quant_dim=qkv_quant_dim,
+        )
+
+        d = dim // num_heads
+        initial = (math.sqrt(2 * d * (1 - 2 / math.pi))
+                   if score_op == "dot_plus" else math.sqrt(d))
+        if temperature_init is not None:
+            initial = float(temperature_init)
+        if not math.isfinite(initial) or initial <= 0:
+            raise ValueError("temperature_init must be finite and positive")
+
+        log_tau = torch.full((num_heads,), math.log(initial),
+                             dtype=torch.float32, device=device)
+        if learnable_temperature:
+            self.log_temperature = nn.Parameter(log_tau)
+        else:
+            self.register_buffer("log_temperature", log_tau)
+
+        self.score_op = score_op
+        self.value_op = value_op
+        self.value_reduction = value_reduction
+        self.is_causal = is_causal
+        self.query_chunk_size = query_chunk_size
+
+    def temperatures(self) -> Tensor:
+        """Positive temperature of each head, [num_heads]."""
+        return self.log_temperature.exp()
+
+    @staticmethod
+    def _parse_attn_bias(attn_bias, B: int, H: int, N: int, device):
+        """Return (float additive bias or None, bool allowed mask or None)."""
+        if attn_bias is None:
+            return None, None
+        if not isinstance(attn_bias, Tensor):
+            raise TypeError("attn_bias must be a Tensor (not an xFormers object)")
+
+        m = attn_bias.to(device=device)
+        if m.ndim == 2:
+            m = m[None, None, :, :]
+        elif m.ndim == 3:
+            m = m[:, None, :, :]
+        elif m.ndim != 4:
+            raise ValueError("attn_bias must be 2D, 3D or 4D")
+        try:
+            m = torch.broadcast_to(m, (B, H, N, N))
+        except RuntimeError as exc:
+            raise ValueError("attn_bias is not broadcastable to [B,H,N,N]") from exc
+
+        if m.dtype == torch.bool:
+            return None, m  # True=allowed (torch SDPA convention)
+        if not m.is_floating_point():
+            raise TypeError("attn_bias must be bool or floating point")
+        if not bool((torch.isfinite(m) | torch.isneginf(m)).all()):
+            raise ValueError("attn_bias must contain finite values or -inf")
+        valid = ~torch.isneginf(m)
+        return m, (None if bool(valid.all()) else valid)
+
+    def _dot_plus_merge(self, weights: Tensor, v: Tensor,
+                        allowed: Tensor | None) -> Tensor:
+        """-sum_k |weights[...,i,k]-v[...,k,j]| over INCLUDED keys only."""
+        if allowed is None:
+            out = -torch.cdist(weights, v.transpose(-2, -1), p=1)
+            if self.value_reduction == "mean":
+                out = out / weights.shape[-1]
+            return out
+
+        B, H, N, L = weights.shape
+        # Query chunks avoid allocating the full [B,H,N,L,head_dim] tensor.
+        chunks = []
+        for start in range(0, N, self.query_chunk_size):
+            stop = min(N, start + self.query_chunk_size)
+            w = weights[:, :, start:stop, :, None]  # [B,H,chunk,L,1]
+            diff = (w - v[:, :, None, :, :]).abs()
+            valid = allowed[:, :, start:stop, :, None]
+            dist = diff.masked_fill(~valid, 0.0).sum(dim=-2)
+            if self.value_reduction == "mean":
+                dist = dist / valid.sum(dim=-2).clamp_min(1)
+            chunks.append(-dist)
+        return torch.cat(chunks, dim=-2)
+
+    def compute_attention(self, qkv: Tensor, attn_bias=None, rope=None) -> Tensor:
+        """Match the original signature: [B,N,3*dim] -> [B,N,dim]."""
+        B, N, _ = qkv.shape
+        C = self.qkv.in_features
+        if qkv.shape[-1] != 3 * C:
+            raise ValueError("qkv must be [B,N,3*dim]")
+        H = self.num_heads
+        d = C // H
+        qkv = qkv.reshape(B, N, 3, H, d)
+        q, k, v = (t.transpose(1, 2) for t in qkv.unbind(dim=2))
+
+        if rope is not None:
+            q, k = self.apply_rope(q, k, rope)  # Preserve the original RoPE.
+
+        # Compute the experimental operation in float32; cast back before the
+        # existing BitLinear output projection (safer for fp16/bfloat16).
+        q, k, v32 = q.float(), k.float(), v.float()
+        if self.score_op == "dot_plus":
+            scores = -torch.cdist(q, k, p=1)
+        else:
+            scores = q @ k.transpose(-2, -1)
+        scores = scores / self.temperatures().to(scores.dtype)[None, :, None, None]
+
+        bias, allowed = self._parse_attn_bias(attn_bias, B, H, N, scores.device)
+        if bias is not None:
+            scores = scores + bias.to(scores.dtype)
+        if self.is_causal:
+            causal = torch.ones((N, N), dtype=torch.bool, device=scores.device).tril()
+            causal = causal[None, None, :, :]
+            allowed = causal if allowed is None else (allowed & causal)
+        if allowed is not None:
+            allowed = torch.broadcast_to(allowed, scores.shape)
+            if not bool(allowed.any(dim=-1).all()):
+                raise ValueError("Each query must have at least one allowed key")
+            scores = scores.masked_fill(~allowed, -torch.inf)
+
+        weights = scores.softmax(dim=-1)
+        p = self.attn_drop.p
+        if self.training and p > 0:
+            keep = torch.rand_like(weights) >= p
+            weights = weights * keep / (1 - p)
+            if self.value_op == "dot_plus":
+                # Dropped weights must exclude their corresponding V too.
+                allowed = keep if allowed is None else (allowed & keep)
+
+        if self.value_op == "dot_plus":
+            out = self._dot_plus_merge(weights, v32, allowed)
+        else:
+            out = weights @ v32
+        return out.to(dtype=v.dtype).transpose(1, 2).reshape(B, N, C)
+
+class DotPlusSelfAttention(DotPlusAttentionMixin, SelfAttention):
+    pass

@@ -12,6 +12,7 @@ import torch.nn.init
 from torch import Tensor, nn
 
 from ternarylayers.dinov3.layers import LayerScale, Mlp, PatchEmbed, RMSNorm, RopePositionEmbedding, SelfAttentionBlock, SwiGLUFFN
+from ternarylayers.dinov3.layers.attention import DotPlusSelfAttention, SelfAttention
 from ternarylayers.dinov3.layers.bitlayers import Linear as BitLinear
 from ternarylayers.dinov3.layers.patch_embed import PatchEmbedNoConv
 from ternarylayers.dinov3.utils import named_apply
@@ -30,6 +31,11 @@ norm_layer_dict = {
     "layernorm": partial(nn.LayerNorm, eps=1e-6),
     "layernormbf16": partial(nn.LayerNorm, eps=1e-5),
     "rmsnorm": RMSNorm,
+}
+
+attn_layer_dict = {
+    "selfattention": SelfAttention,
+    "dotpluseattention": DotPlusSelfAttention,
 }
 
 dtype_dict = {
@@ -81,6 +87,7 @@ class DinoVisionTransformer(nn.Module):
         drop_path_rate: float = 0.0,
         layerscale_init: float | None = None,
         norm_layer: str = "layernorm",
+        attn_layer: str = "selfattention",
         ffn_layer: str = "mlp",
         ffn_bias: bool = True,
         proj_bias: bool = True,
@@ -131,6 +138,7 @@ class DinoVisionTransformer(nn.Module):
         self.no_conv = no_conv
         
         norm_layer_cls = norm_layer_dict[norm_layer]
+        attn_layer_cls = attn_layer_dict[attn_layer]
 
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
         self.n_blocks = depth
@@ -184,6 +192,7 @@ class DinoVisionTransformer(nn.Module):
                 drop_path=drop_path_rate,
                 norm_layer=norm_layer_cls,
                 act_layer=nn.GELU,
+                attn_class=attn_layer_cls,
                 ffn_layer=ffn_layer_cls,
                 init_values=layerscale_init,
                 mask_k_bias=mask_k_bias,
